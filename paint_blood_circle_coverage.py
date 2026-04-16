@@ -81,6 +81,106 @@ def _scope_outline(mask: np.ndarray) -> np.ndarray:
     return dilated & ~mask
 
 
+# -- Fast path ----------------------------------------------------------------
+# Sample only the 9,477 scope-disc pixels (not all 4.2M), and do both wears in
+# a single gather by packing FT-bloody into bit 0 and BS/WW-bloody into bit 1
+# of a combined 2048×2048 u8 bitmap. Same RGB-darkness rule as the slow path,
+# but ~500x faster -- typically <1 ms per seed once caches are warm.
+
+_FAST_CACHE: dict = {}
+
+
+def _fast_init(threshold: float):
+    """Precompute scope pixel UV coords + combined threshold bitmap (cached)."""
+    key = round(threshold, 6)
+    cached = _FAST_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    # (1) Scope pixels in UV space
+    mask = get_scope_mask()                      # (2048, 2048) bool
+    ys, xs = np.where(mask)
+    H, W = mask.shape
+    scope_u = (xs.astype(np.float32) / W)
+    scope_v = (ys.astype(np.float32) / H)
+
+    # (2) Combined bitmap (bit 0 = FT bloody, bit 1 = Buckets bloody).
+    ft_img = load_vtf_as_pil(WEAR_BLOOD_TEXTURE[3], mode="RGBA")
+    bk_img = load_vtf_as_pil(WEAR_BLOOD_TEXTURE[5], mode="RGBA")
+    ft_rgb = np.asarray(ft_img)[..., :3]
+    bk_rgb = np.asarray(bk_img)[..., :3]
+    # darkness = 1 - min(R,G,B)/255 >= threshold
+    #        <=> min(R,G,B) <= round(255 * (1 - threshold))
+    cutoff = int(round(255 * (1.0 - threshold)))
+    ft_bloody = (ft_rgb.min(axis=-1) <= cutoff).astype(np.uint8)
+    bk_bloody = (bk_rgb.min(axis=-1) <= cutoff).astype(np.uint8)
+    combined  = (ft_bloody | (bk_bloody << 1)).astype(np.uint8)
+
+    state = {
+        "scope_u":  scope_u,
+        "scope_v":  scope_v,
+        "n_scope":  int(len(scope_u)),
+        "combined": combined,
+        "W":        int(W),
+        "H":        int(H),
+    }
+    _FAST_CACHE[key] = state
+    return state
+
+
+def measure_coverage_fast(seed: int,
+                          threshold: float = 0.20
+                          ) -> tuple[float, float]:
+    """Fast bloodscope coverage for BOTH wears of a seed.
+
+    Returns (field_tested_pct, battle_scarred_pct). BS and WW share the
+    same result (see docstring of paint_blood_circle_coverage.py).
+
+    Roughly 500x faster than measure_coverage(); designed for sweeping
+    hundreds of seeds (the market scanner). Matches measure_coverage()
+    bit-for-bit at the default threshold 0.20.
+    """
+    st = _fast_init(threshold)
+    scope_u  = st["scope_u"]
+    scope_v  = st["scope_v"]
+    combined = st["combined"]
+    n        = st["n_scope"]
+    W        = st["W"]
+    H        = st["H"]
+
+    r = compute_blood_uv(seed)
+    tu    = round(r["u"],        3)
+    tv    = round(r["v"],        3)
+    rot   = round(r["rotation"], 3)
+    scale = round(r["scale"],    3)
+
+    # Factored affine: pattern_uv = (R·S)·output_uv + (R·S)·t  = M·uv + tp
+    rad  = np.float32(np.radians(rot))
+    c    = np.cos(rad)
+    s    = np.sin(rad)
+    mc   = np.float32(scale) * c
+    ms   = np.float32(scale) * s
+    tpx  = mc * np.float32(tu) - ms * np.float32(tv)
+    tpy  = ms * np.float32(tu) + mc * np.float32(tv)
+
+    # Add-BIG trick (see rust_bloodscope/src/shader.wgsl): shifts usrc/vsrc
+    # into the strictly-positive range, and because BIG*W is a multiple of W
+    # the bottom log2(W) bits survive the AND-mask unchanged -- we get the
+    # same pixel index as a floor-mod would, without actually doing floor().
+    BIG = np.float32(1024.0)
+
+    u_src = mc * scope_u - ms * scope_v + tpx + BIG
+    v_src = ms * scope_u + mc * scope_v + tpy + BIG
+
+    sx = (u_src * np.float32(W)).astype(np.int64) & (W - 1)
+    sy = (v_src * np.float32(H)).astype(np.int64) & (H - 1)
+
+    bits    = combined[sy, sx]
+    ft_hits = int((bits & 1).sum())
+    bk_hits = int(((bits >> 1) & 1).sum())
+    return (100.0 * ft_hits / n, 100.0 * bk_hits / n)
+
+
 # -- Coverage ------------------------------------------------------------------
 def measure_coverage(seed: int, wear: int,
                      threshold: float = 0.20) -> dict:

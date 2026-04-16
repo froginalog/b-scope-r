@@ -53,7 +53,7 @@ except ImportError:
 # Reuse existing bloodscope pipeline
 REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR))
-from paint_blood_circle_coverage import measure_coverage  # noqa: E402
+from paint_blood_circle_coverage import measure_coverage_fast  # noqa: E402
 
 
 # -- Config --------------------------------------------------------------------
@@ -332,19 +332,21 @@ def main():
         _save_seed_cache(cache)
         print(f"      resolved in {time.time() - t0:.1f}s")
 
-        print("[4/4] computing bloodscope coverage...")
-        for i, l in enumerate(listings, 1):
+        print("[4/4] computing bloodscope coverage (fast path)...")
+        t0 = time.time()
+        for l in listings:
             if not l.get("seed"):
                 continue
             try:
-                ft = measure_coverage(l["seed"], 3, threshold=args.threshold)
-                bs = measure_coverage(l["seed"], 5, threshold=args.threshold)
-                l["ft_pct"] = round(ft["coverage_pct"], 2)
-                l["bs_pct"] = round(bs["coverage_pct"], 2)
+                ft_pct, bs_pct = measure_coverage_fast(
+                    l["seed"], threshold=args.threshold)
+                l["ft_pct"] = round(ft_pct, 2)
+                l["bs_pct"] = round(bs_pct, 2)
             except Exception as e:
                 print(f"      seed {l['seed']} bloodscope error: {e}")
                 l["ft_pct"] = None
                 l["bs_pct"] = None
+        print(f"      done in {time.time() - t0:.2f}s")
 
     # Output CSV
     columns = ["mannco_id", "product_name", "wear_name", "price_cents",
