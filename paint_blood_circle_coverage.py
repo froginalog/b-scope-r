@@ -129,16 +129,21 @@ def _fast_init(threshold: float):
 
 
 def measure_coverage_fast(seed: int,
-                          threshold: float = 0.20
+                          threshold: float = 0.20,
+                          scale_range: tuple[float, float] = (0.4, 0.5),
                           ) -> tuple[float, float]:
     """Fast bloodscope coverage for BOTH wears of a seed.
 
     Returns (field_tested_pct, battle_scarred_pct). BS and WW share the
     same result (see docstring of paint_blood_circle_coverage.py).
 
+    scale_range is the paintkit's `scale_uv` range. Harvest uses
+    (0.4, 0.5); Night Owl, Purple Range etc. use (0.6, 0.7). Pass the
+    value from BLOOD_PAINT_INDICES for the listing's paint_index.
+
     Roughly 500x faster than measure_coverage(); designed for sweeping
     hundreds of seeds (the market scanner). Matches measure_coverage()
-    bit-for-bit at the default threshold 0.20.
+    bit-for-bit at the default threshold 0.20 / scale_range (0.4, 0.5).
     """
     st = _fast_init(threshold)
     scope_u  = st["scope_u"]
@@ -148,7 +153,7 @@ def measure_coverage_fast(seed: int,
     W        = st["W"]
     H        = st["H"]
 
-    r = compute_blood_uv(seed)
+    r = compute_blood_uv(seed, scale_range=scale_range)
     tu    = round(r["u"],        3)
     tv    = round(r["v"],        3)
     rot   = round(r["rotation"], 3)

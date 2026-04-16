@@ -172,18 +172,27 @@ BLOOD_ALLOW_FLIP_V  = False
 
 
 # -- Core compute --------------------------------------------------------------
-def compute_blood_uv(paint_kit_seed: int, use_float32: bool = True) -> dict:
+def compute_blood_uv(paint_kit_seed: int,
+                     use_float32: bool = True,
+                     scale_range: tuple[float, float] = BLOOD_SCALE_UV
+                     ) -> dict:
     """
     Compute the paint_blood UV transform for the given paint_kit_seed.
 
     paint_kit_seed : integer value of the 'paint_kit_seed' item attribute.
     use_float32    : match C++ float32 precision (recommended: True).
+    scale_range    : (min, max) for the paintkit's scale_uv field. The
+                     Harvest family uses (0.4, 0.5); Night Owl, Purple Range,
+                     Lumber From Down Under, Bog Trotter, Thunderbolt, and
+                     Shot in the Dark use (0.6, 0.7); Homemade Heater uses
+                     (0.2, 0.3); etc. Defaults to Harvest's range for
+                     backwards compatibility.
 
     Returns a dict with keys:
       seed_hi, seed_lo  - deinterleaved 32-bit seeds
       u, v              - translateU, translateV  in [0, 1]
       rotation          - rotation in degrees [0, 360)
-      scale             - scaleUV in [0.4, 0.5]
+      scale             - scaleUV in scale_range
       adjust_black      - 0.0 (fixed for blood)
       adjust_white      - 1.0 (= black + offset, fixed)
       adjust_gamma      - 1.0 (fixed for blood)
@@ -208,7 +217,7 @@ def compute_blood_uv(paint_kit_seed: int, use_float32: bool = True) -> dict:
     u     = rng.random_float(*BLOOD_TRANSLATE_U,   use_float32=f32)
     v     = rng.random_float(*BLOOD_TRANSLATE_V,   use_float32=f32)
     rot   = rng.random_float(*BLOOD_ROTATION,      use_float32=f32)
-    scale = rng.random_float(*BLOOD_SCALE_UV,      use_float32=f32)
+    scale = rng.random_float(*scale_range,         use_float32=f32)
     adj_b = rng.random_float(*BLOOD_ADJUST_BLACK,  use_float32=f32)
     adj_o = rng.random_float(*BLOOD_ADJUST_OFFSET, use_float32=f32)
     adj_g = rng.random_float(*BLOOD_ADJUST_GAMMA,  use_float32=f32)

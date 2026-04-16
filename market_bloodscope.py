@@ -54,6 +54,10 @@ except ImportError:
 REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR))
 from paint_blood_circle_coverage import measure_coverage_fast  # noqa: E402
+from paint_blood_paintkits import (                               # noqa: E402
+    BLOOD_PAINT_INDICES,
+    DEF_INDEX_TO_PAINT_INDEX,
+)
 
 
 # -- Config --------------------------------------------------------------------
@@ -180,7 +184,11 @@ def fetch_product_listings(session, product_id: int, product_url: str,
 # Bumping this invalidates cached seeds from older versions of the tool.
 # v1: original_id (WRONG for tool-applied warpaints)
 # v2: custom_paintkit_seed / attrs 866+867 (correct for live TF2)
-SEED_CACHE_VERSION = 2
+# v3: also stores paint_index so we can filter non-blood paintkits without
+#     round-tripping the inspect API again
+# v4: paint_index now uses DEF_INDEX_TO_PAINT_INDEX fallback for pre-built
+#     paintkit items (attribute 834 is absent; static_attrs carries it)
+SEED_CACHE_VERSION = 4
 
 
 def _load_seed_cache() -> dict:
@@ -257,15 +265,13 @@ def _extract_seed(econitem: dict) -> int | None:
     return None
 
 
-def resolve_seed(inspect_url: str, session) -> int | None:
-    """GET inspecttf2.accurateskins.com and extract paint_kit_seed.
+def resolve_seed(inspect_url: str, session) -> tuple[int | None, int | None]:
+    """GET inspecttf2.accurateskins.com and return (paint_kit_seed, paint_index).
 
-    See _extract_seed() for field priority. Live TF2 assembles the seed from
-    attributes 866 (lo) + 867 (hi); the accurateskins API surfaces this as
-    `custom_paintkit_seed`. We used to return `original_id` which is only
-    correct for a subset of items (native crate drops where no paint tool
-    was applied); for tool-painted items it gives a completely unrelated
-    u32 number (the weapon's creation asset_id).
+    paint_index (the paintkit_proto_def_index, attr def_index 834) identifies
+    WHICH paintkit was applied -- we use it to filter out paintkits whose
+    compositor doesn't actually render blood (or renders it with a different
+    UV transform than our math is calibrated for). See BLOOD_PAINT_INDICES.
     """
     for attempt in range(3):
         try:
@@ -275,14 +281,31 @@ def resolve_seed(inspect_url: str, session) -> int | None:
                 time.sleep(5 * (attempt + 1))
                 continue
             if r.status_code != 200:
-                return None
+                return (None, None)
             body = r.json()
             if not body.get("success"):
-                return None
-            return _extract_seed(body.get("item", {}).get("econitem"))
+                return (None, None)
+            econ = body.get("item", {}).get("econitem") or {}
+            seed = _extract_seed(econ)
+            pindex = econ.get("paint_index")
+            try:
+                pindex = int(pindex) if pindex is not None else None
+            except (TypeError, ValueError):
+                pindex = None
+            # Pre-built paintkit items (def_index 15000+) don't carry attr
+            # 834 at runtime -- their paint_index lives in static_attrs. Use
+            # the item's def_index to look it up.
+            if pindex is None:
+                try:
+                    d = int(econ.get("def_index") or 0)
+                except (TypeError, ValueError):
+                    d = 0
+                if d:
+                    pindex = DEF_INDEX_TO_PAINT_INDEX.get(d)
+            return (seed, pindex)
         except Exception:
             time.sleep(2 * (attempt + 1))
-    return None
+    return (None, None)
 
 
 # -- CLI ----------------------------------------------------------------------
@@ -379,49 +402,92 @@ def main():
         t0 = time.time()
         for i, l in enumerate(listings, 1):
             key = l["inspect_url"]
-            cached = cache.get(key, {}).get("seed")
-            if cached:
-                l["seed"] = int(cached)
+            entry = cache.get(key) or {}
+            cached_seed   = entry.get("seed")
+            cached_pindex = entry.get("paint_index")
+            if cached_seed and cached_pindex is not None:
+                l["seed"]        = int(cached_seed)
+                l["paint_index"] = int(cached_pindex)
                 print(f"      [{i:>3}/{len(listings)}] {l['mannco_id']:>10}  "
-                      f"(cached)  seed={l['seed']}")
+                      f"(cached)  seed={l['seed']}  pi={l['paint_index']}")
             else:
                 t = time.time()
-                seed = resolve_seed(key, session)
+                seed, pindex = resolve_seed(key, session)
                 ms = int((time.time() - t) * 1000)
                 if seed is None:
-                    l["seed"] = None
+                    l["seed"]        = None
+                    l["paint_index"] = pindex
                     print(f"      [{i:>3}/{len(listings)}] {l['mannco_id']:>10}  "
                           f"({ms} ms) FAILED")
                 else:
-                    l["seed"] = seed
-                    cache[key] = {"seed": seed}
+                    l["seed"]        = seed
+                    l["paint_index"] = pindex
+                    cache[key] = {"seed": seed, "paint_index": pindex}
                     print(f"      [{i:>3}/{len(listings)}] {l['mannco_id']:>10}  "
-                          f"({ms} ms) seed={seed}")
+                          f"({ms} ms) seed={seed}  pi={pindex}")
                 if i % 10 == 0:
                     _save_seed_cache(cache)
                 time.sleep(args.api_delay)
         _save_seed_cache(cache)
         print(f"      resolved in {time.time() - t0:.1f}s")
 
-        print("[4/4] computing bloodscope coverage (fast path)...")
+        # Only compute bloodscope for listings whose paintkit is in
+        # BLOOD_PAINT_INDICES (visibly renders paint_blood with our
+        # compatible UV transform). The per-wear scale_uv range is
+        # paintkit-specific (Harvest uses 0.4-0.5, Night Owl 0.6-0.7, etc.)
+        # and we thread it through measure_coverage_fast.
+        print("[4/4] computing bloodscope coverage for BLOOD paintkits "
+              "(fast path, paintkit-specific scale)...")
         t0 = time.time()
+        skipped_non_blood = 0
         for l in listings:
             if not l.get("seed"):
                 continue
+            pi = l.get("paint_index")
+            blood = BLOOD_PAINT_INDICES.get(pi) if pi is not None else None
+            if blood is None:
+                l["ft_pct"] = None
+                l["bs_pct"] = None
+                l["is_blood_paintkit"] = False
+                skipped_non_blood += 1
+                continue
+            name, per_wear = blood
+            l["is_blood_paintkit"] = True
+            l["paintkit_name"]     = name
             try:
-                ft_pct, bs_pct = measure_coverage_fast(
-                    l["seed"], threshold=args.threshold)
-                l["ft_pct"] = round(ft_pct, 2)
-                l["bs_pct"] = round(bs_pct, 2)
+                # For FT wear (wear 3): use its scale_uv range + texture.
+                # For BS wear (wear 5 -- same as WW=4): use its range.
+                # Most paintkits have identical scale at both wears, but we
+                # look each up independently to be safe.
+                ft_info = per_wear.get(3)
+                bs_info = per_wear.get(5) or per_wear.get(4)
+                if ft_info is not None:
+                    ft_scale = (ft_info[0], ft_info[1])
+                    ft_pct, _ = measure_coverage_fast(
+                        l["seed"], threshold=args.threshold,
+                        scale_range=ft_scale)
+                    l["ft_pct"] = round(ft_pct, 2)
+                else:
+                    l["ft_pct"] = None
+                if bs_info is not None:
+                    bs_scale = (bs_info[0], bs_info[1])
+                    _, bs_pct = measure_coverage_fast(
+                        l["seed"], threshold=args.threshold,
+                        scale_range=bs_scale)
+                    l["bs_pct"] = round(bs_pct, 2)
+                else:
+                    l["bs_pct"] = None
             except Exception as e:
                 print(f"      seed {l['seed']} bloodscope error: {e}")
                 l["ft_pct"] = None
                 l["bs_pct"] = None
-        print(f"      done in {time.time() - t0:.2f}s")
+        print(f"      done in {time.time() - t0:.2f}s  "
+              f"({skipped_non_blood} non-blood paintkit(s) skipped)")
 
     # Output CSV
     columns = ["mannco_id", "product_name", "wear_name", "price_cents",
-               "seed", "ft_pct", "bs_pct", "mannco_page_url",
+               "seed", "paint_index", "paintkit_name", "is_blood_paintkit",
+               "ft_pct", "bs_pct", "mannco_page_url",
                "inspect_url", "seller_steamid", "asset_id"]
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=columns)
@@ -432,19 +498,34 @@ def main():
 
     # Summary
     if args.auto_resolve:
-        resolved = [l for l in listings if l.get("seed") is not None
-                    and l.get("ft_pct") is not None]
+        resolved = [l for l in listings
+                    if l.get("is_blood_paintkit")
+                    and (l.get("ft_pct") is not None
+                         or l.get("bs_pct") is not None)]
         if resolved:
-            resolved.sort(key=lambda r: max(r["ft_pct"], r["bs_pct"]),
-                          reverse=True)
-            print(f"\n=== Top bloodscopes ({len(resolved)} resolved) ===")
+            def _score(r):
+                return max(r.get("ft_pct") or 0, r.get("bs_pct") or 0)
+            resolved.sort(key=_score, reverse=True)
+            print(f"\n=== Top bloodscopes "
+                  f"({len(resolved)} blood-paintkit listings resolved) ===")
             print(f"  {'wear':16s}  {'FT%':>6s}  {'BS%':>6s}  "
-                  f"{'price':>8s}  {'seed':>12s}  mannco page")
+                  f"{'price':>8s}  {'seed':>20s}  mannco page")
             for l in resolved[:25]:
-                ft, bs = l["ft_pct"], l["bs_pct"]
-                print(f"  {l['wear_name']:16s}  {ft:6.2f}  {bs:6.2f}  "
-                      f"${l['price_cents']/100:6.2f}  {l['seed']:>12d}  "
+                ft = l.get("ft_pct")
+                bs = l.get("bs_pct")
+                ft_s = f"{ft:6.2f}" if ft is not None else "    --"
+                bs_s = f"{bs:6.2f}" if bs is not None else "    --"
+                print(f"  {l['wear_name']:16s}  {ft_s}  {bs_s}  "
+                      f"${l['price_cents']/100:6.2f}  {l['seed']:>20d}  "
                       f"{l['mannco_page_url']}")
+
+        # Show how many listings were skipped because their paintkit isn't
+        # blood-compatible (so the user knows WHY only a subset resolved).
+        non_blood = [l for l in listings
+                     if l.get("seed") is not None and not l.get("is_blood_paintkit")]
+        if non_blood:
+            print(f"\n  ({len(non_blood)} listing(s) skipped: paintkit isn't in "
+                  f"BLOOD_PAINT_INDICES -- wrong UV transform or no visible blood)")
 
 
 if __name__ == "__main__":
