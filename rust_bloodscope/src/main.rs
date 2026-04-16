@@ -14,6 +14,8 @@
 //!
 //! Output is a binary file: seed `s` maps to byte `s - start` = pct (0..=100).
 
+mod gpu;
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -341,6 +343,15 @@ struct Args {
     #[arg(long, default_value_t = 1u64 << 20)]
     chunk: u64,
 
+    /// Use GPU (wgpu) backend. Full accuracy, ignores --subsample.
+    #[arg(long)]
+    gpu: bool,
+
+    /// GPU dispatch batch size (threads per compute submit). Larger is
+    /// faster but risks a TDR timeout on long kernels. Default 4M.
+    #[arg(long, default_value_t = 1u32 << 22)]
+    gpu_batch: u32,
+
     /// Only run the self-test and exit.
     #[arg(long)]
     self_test: bool,
@@ -439,11 +450,89 @@ fn main() -> std::io::Result<()> {
 
     // Combined (bit0=FT, bit1=Buckets) pattern for the dual path -- halves
     // pattern lookups when both wears are requested.
-    let combined: Vec<u8> = if wants_ft && wants_buckets {
-        combine_patterns(&pat_ft, &pat_buckets)
+    let combined: Vec<u8> = if (wants_ft && wants_buckets) || args.gpu {
+        // GPU always uses combined regardless of --wear, since the shader
+        // unconditionally samples both bits. We'll mask off unwanted output.
+        let pf = if wants_ft      { &pat_ft[..]      } else { &vec![0u8; (W*H) as usize][..] };
+        let pb = if wants_buckets { &pat_buckets[..] } else { &vec![0u8; (W*H) as usize][..] };
+        let mut out = vec![0u8; (W * H) as usize];
+        for i in 0..out.len() {
+            out[i] = (pf[i] & 1) | ((pb[i] & 1) << 1);
+        }
+        out
     } else {
         Vec::new()
     };
+
+    // -------- GPU path --------
+    if args.gpu {
+        eprintln!("Initializing GPU...");
+        let runner = pollster::block_on(gpu::GpuRunner::new(
+            &offsets,
+            &combined,
+            args.gpu_batch,
+        )).unwrap_or_else(|e| {
+            eprintln!("GPU init failed: {e}");
+            std::process::exit(3);
+        });
+
+        let t0 = Instant::now();
+        let mut done: u64 = 0;
+        let mut next_report = Instant::now() + std::time::Duration::from_secs(2);
+
+        let mut cur = args.start;
+        while cur < args.end {
+            let remaining = (args.end - cur).min(args.gpu_batch as u64);
+            let n = remaining as u32;
+            let packed = runner.run_batch(cur, n);
+
+            // Unpack to two Vec<u8>
+            let mut ft_buf = if wants_ft      { Vec::with_capacity(n as usize) } else { Vec::new() };
+            let mut bk_buf = if wants_buckets { Vec::with_capacity(n as usize) } else { Vec::new() };
+            for &w in &packed {
+                if wants_ft      { ft_buf.push( (w & 0xFF) as u8); }
+                if wants_buckets { bk_buf.push(((w >> 8) & 0xFF) as u8); }
+            }
+
+            if let Some(w) = ft_writer.as_mut() { w.write_all(&ft_buf)?; }
+            if let Some(w) = bk_writer.as_mut() { w.write_all(&bk_buf)?; }
+            if let Some(w) = csv_writer.as_mut() {
+                let min = args.min_pct;
+                for i in 0..n as usize {
+                    let fv = if wants_ft { ft_buf[i] } else { 0 };
+                    let bv = if wants_buckets { bk_buf[i] } else { 0 };
+                    if fv >= min || bv >= min {
+                        writeln!(w, "{},{},{}", cur + i as u64, fv, bv)?;
+                    }
+                }
+            }
+
+            done += n as u64;
+            cur  += n as u64;
+
+            if Instant::now() >= next_report {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let rate    = done as f64 / elapsed;
+                let eta     = (total - done) as f64 / rate;
+                eprintln!(
+                    "  {:>12}/{} seeds  ({:5.2}%)  {:>10.0} seed/s  elapsed {:.0}s  ETA {:.0}s",
+                    done, total, 100.0 * done as f64 / total as f64,
+                    rate, elapsed, eta
+                );
+                next_report = Instant::now() + std::time::Duration::from_secs(5);
+            }
+        }
+
+        if let Some(w) = ft_writer.as_mut()  { w.flush()?; }
+        if let Some(w) = bk_writer.as_mut()  { w.flush()?; }
+        if let Some(w) = csv_writer.as_mut() { w.flush()?; }
+
+        let elapsed = t0.elapsed().as_secs_f64();
+        eprintln!("\nDone (GPU: {}). {} seeds in {:.1}s  ({:.0} seed/s)",
+            runner.adapter_name, total, elapsed, total as f64 / elapsed);
+        eprintln!("Output dir: {:?}", args.out);
+        return Ok(());
+    }
 
     let t0 = Instant::now();
     let mut done: u64 = 0;
