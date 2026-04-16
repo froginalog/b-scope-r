@@ -26,3 +26,12 @@ verify_out_small/
 market_bloodscopes.csv
 test_market.csv
 test_seeds.csv
+
+# Node.js resolver artifacts
+tools/node_modules/
+tools/.steam-user-data/
+tools/*.log
+
+# Secrets / local config
+*.local.json
+steam_config.json

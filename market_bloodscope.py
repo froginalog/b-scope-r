@@ -38,9 +38,14 @@ Usage
 
 import argparse
 import csv
+import getpass
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -256,6 +261,94 @@ def load_seeds_csv(path: Path) -> dict[str, int]:
     return out
 
 
+# -- Node.js resolver orchestration -------------------------------------------
+RESOLVER_DIR    = REPO_DIR / "tools"
+RESOLVER_JS     = RESOLVER_DIR / "resolve_seeds.js"
+RESOLVER_NODEMO = RESOLVER_DIR / "node_modules"
+
+
+def _ensure_resolver_installed() -> str:
+    """Locate Node.js and install tools/ dependencies if needed.
+
+    Returns the path to the node executable.
+    """
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError(
+            "node.js is required for --auto-resolve. "
+            "Install Node 18+ from https://nodejs.org and try again."
+        )
+    if not RESOLVER_JS.exists():
+        raise RuntimeError(f"resolver script missing at {RESOLVER_JS}")
+    if not RESOLVER_NODEMO.exists():
+        npm = shutil.which("npm")
+        if not npm:
+            raise RuntimeError("npm is required to install resolver deps.")
+        print(f"  installing resolver deps (first run)... ", end="", flush=True)
+        r = subprocess.run(
+            [npm, "install", "--no-audit", "--no-fund"],
+            cwd=RESOLVER_DIR, capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"npm install failed:\n{r.stderr}")
+        print("done.")
+    return node
+
+
+def run_auto_resolver(unresolved_rows: list[dict],
+                      username: str,
+                      password: str,
+                      two_factor: str | None,
+                      request_delay_ms: int = 2500) -> dict[str, int]:
+    """Spawn the Node.js helper to inspect listings and return listing_id -> seed.
+
+    Writes a temp inspect_urls.csv, runs node tools/resolve_seeds.js, reads
+    back the seeds.csv. Streams the helper's stdout live so the user can
+    watch progress.
+    """
+    node = _ensure_resolver_installed()
+
+    with tempfile.TemporaryDirectory(prefix="bloodscope_gc_") as tmpdir:
+        tmp = Path(tmpdir)
+        in_csv  = tmp / "inspect_urls.csv"
+        out_csv = tmp / "seeds.csv"
+        config  = tmp / "config.json"
+
+        with open(in_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["listing_id", "inspect_url"])
+            w.writeheader()
+            for r in unresolved_rows:
+                if r.get("inspect_url"):
+                    w.writerow({
+                        "listing_id":  r["listing_id"],
+                        "inspect_url": r["inspect_url"],
+                    })
+
+        cfg = {
+            "username":         username,
+            "password":         password,
+            "input":            str(in_csv),
+            "output":           str(out_csv),
+            "request_delay_ms": int(request_delay_ms),
+        }
+        if two_factor:
+            cfg["two_factor_code"] = two_factor
+        config.write_text(json.dumps(cfg), encoding="utf-8")
+
+        est_sec = (request_delay_ms / 1000.0) * max(1, len(unresolved_rows))
+        print(f"  spawning Node.js resolver (≈{est_sec:.0f}s estimated "
+              f"for {len(unresolved_rows)} items)...")
+        rc = subprocess.run(
+            [node, str(RESOLVER_JS), str(config)],
+        ).returncode
+        if rc != 0:
+            print(f"  WARNING: resolver exited with code {rc}", file=sys.stderr)
+
+        if not out_csv.exists():
+            return {}
+        return load_seeds_csv(out_csv)
+
+
 # -- CLI ----------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(
@@ -278,6 +371,19 @@ def main():
                    help="Output CSV path (default market_bloodscopes.csv).")
     p.add_argument("--threshold", type=float, default=0.20,
                    help="Darkness threshold for 'bloody' pixel (default 0.20).")
+    # --auto-resolve: spawn the Node.js TF2 GC client to fetch seeds
+    p.add_argument("--auto-resolve", action="store_true",
+                   help="Automatically resolve seeds via the Node.js TF2 GC "
+                        "helper (requires Steam login + Node 18+).")
+    p.add_argument("--steam-user", default=os.environ.get("STEAM_USER"),
+                   help="Steam account name (or set $STEAM_USER).")
+    p.add_argument("--steam-pass", default=os.environ.get("STEAM_PASS"),
+                   help="Steam password (or set $STEAM_PASS). Prompted if omitted.")
+    p.add_argument("--steam-2fa", default=os.environ.get("STEAM_2FA"),
+                   help="Steam Guard mobile code (or set $STEAM_2FA).")
+    p.add_argument("--gc-delay-ms", type=int, default=2500,
+                   help="Delay between GC inspect requests (default 2500 ms, "
+                        "matches the TF2 client's internal cooldown).")
     args = p.parse_args()
 
     wears = {int(w) for w in args.wears.split(",") if w.strip()}
@@ -333,6 +439,33 @@ def main():
         else:
             seeds_map = load_seeds_csv(args.seeds_csv)
             print(f"  loaded {len(seeds_map)} seeds from {args.seeds_csv}")
+
+    # 3b. Auto-resolve any still-unresolved listings via Node.js GC helper
+    if args.auto_resolve:
+        unresolved_rows = [l for l in filtered
+                           if l["listing_id"] not in seeds_map
+                           and l["inspect_url"]]
+        if unresolved_rows:
+            user = args.steam_user
+            pw   = args.steam_pass
+            if not user:
+                user = input("Steam account name: ").strip()
+            if not pw:
+                pw = getpass.getpass("Steam password: ")
+            two_fa = args.steam_2fa
+            if not two_fa:
+                maybe = input("Steam Guard mobile code (blank to skip): ").strip()
+                two_fa = maybe if maybe else None
+            try:
+                resolved = run_auto_resolver(
+                    unresolved_rows, user, pw, two_fa,
+                    request_delay_ms=args.gc_delay_ms,
+                )
+            except RuntimeError as e:
+                print(f"  auto-resolve failed: {e}", file=sys.stderr)
+                resolved = {}
+            seeds_map.update(resolved)
+            print(f"  auto-resolved {len(resolved)}/{len(unresolved_rows)} seeds")
 
     # 4. Compute bloodscope for resolved seeds
     rows = []
