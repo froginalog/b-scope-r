@@ -518,44 +518,65 @@ def main():
               f"(verified={verified}, inferred={inferred}, "
               f"non-blood skipped={skipped_non_blood})")
 
+    # Stamp each listing with its "own-wear bloodscope": the coverage %
+    # for the SAME wear the item is actually sold as. A Field-Tested
+    # listing only gets credit for the FT-pattern coverage (paint_blood);
+    # a Well-Worn or Battle-Scarred listing only gets credit for the
+    # BS-pattern coverage (paint_blood_buckets, which WW and BS share).
+    # Cross-wear numbers are irrelevant to the buyer and must not skew
+    # the ranking.
+    def _own_wear_score(l) -> float:
+        # Listings stamp the wear number under "wear_num" (not "wear").
+        w = l.get("wear_num")
+        if w == 3:
+            v = l.get("ft_pct")
+        elif w in (4, 5):
+            v = l.get("bs_pct")
+        else:
+            v = None
+        return float(v) if v is not None else 0.0
+
+    for l in listings:
+        l["blood_score"] = _own_wear_score(l)
+
+    # Sort listings by own-wear bloodscope descending before writing.
+    listings.sort(key=lambda l: l.get("blood_score") or 0.0, reverse=True)
+
     # Output CSV
     columns = ["mannco_id", "product_name", "wear_name", "price_cents",
                "seed", "paint_index", "paintkit_name", "is_blood_paintkit",
-               "ft_pct", "bs_pct", "mannco_page_url",
+               "ft_pct", "bs_pct", "blood_score", "mannco_page_url",
                "inspect_url", "seller_steamid", "asset_id"]
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=columns)
         w.writeheader()
         for l in listings:
             w.writerow({c: l.get(c, "") for c in columns})
-    print(f"\nwrote {args.out} ({len(listings)} rows)")
+    print(f"\nwrote {args.out} ({len(listings)} rows, sorted by blood_score)")
 
-    # Summary
+    # Summary (full list, sorted by own-wear score descending)
     if args.auto_resolve:
         resolved = [l for l in listings
                     if l.get("is_blood_paintkit")
+                    and l.get("blood_score") is not None
                     and (l.get("ft_pct") is not None
                          or l.get("bs_pct") is not None)]
         if resolved:
-            def _score(r):
-                return max(r.get("ft_pct") or 0, r.get("bs_pct") or 0)
-            resolved.sort(key=_score, reverse=True)
-            print(f"\n=== Top bloodscopes "
-                  f"({len(resolved)} listings with visible blood) ===")
-            print(f"  {'wear':16s}  {'FT%':>6s}  {'BS%':>6s}  "
-                  f"{'inf':>3s}  {'price':>8s}  {'seed':>20s}  mannco page")
-            for l in resolved[:25]:
-                ft = l.get("ft_pct")
-                bs = l.get("bs_pct")
-                ft_s = f"{ft:6.2f}" if ft is not None else "    --"
-                bs_s = f"{bs:6.2f}" if bs is not None else "    --"
+            # Already sorted by blood_score (done above). Show them all.
+            print(f"\n=== All bloodscopes ({len(resolved)} listings, ranked by "
+                  f"own-wear coverage) ===")
+            print(f"  {'score':>6s}  {'wear':16s}  {'inf':>3s}  "
+                  f"{'price':>8s}  {'seed':>20s}  mannco page")
+            for l in resolved:
+                sc = l.get("blood_score") or 0.0
                 inf = "?" if l.get("is_blood_paintkit") == "inferred" else " "
-                print(f"  {l['wear_name']:16s}  {ft_s}  {bs_s}  "
-                      f"{inf:>3s}  ${l['price_cents']/100:6.2f}  "
+                print(f"  {sc:6.2f}  {l['wear_name']:16s}  {inf:>3s}  "
+                      f"${l['price_cents']/100:6.2f}  "
                       f"{l['seed']:>20d}  {l['mannco_page_url']}")
-            print("  ('?' = paintkit name unknown -- scale range inferred as "
-                  "(0.4, 0.5). Numbers may be slightly off for paintkits that "
-                  "use a different scale_uv range.)")
+            print("  'score' = coverage on the blood pattern THIS wear uses")
+            print("           (FT -> paint_blood, WW/BS -> paint_blood_buckets)")
+            print("  '?'     = community paintkit, scale range inferred as "
+                  "(0.4, 0.5) so the number may be slightly off")
 
         non_blood = [l for l in listings
                      if l.get("seed") is not None
