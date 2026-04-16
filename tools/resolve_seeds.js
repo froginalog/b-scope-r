@@ -36,8 +36,26 @@
 "use strict";
 
 const SteamUser = require("steam-user");
-const fs = require("fs");
-const path = require("path");
+const fs        = require("fs");
+const path      = require("path");
+
+// Force line-buffered output -- on Windows, Node may block-buffer stdout
+// when it's piped through a parent process, which hides live progress.
+if (process.stdout._handle && process.stdout._handle.setBlocking) {
+    process.stdout._handle.setBlocking(true);
+}
+if (process.stderr._handle && process.stderr._handle.setBlocking) {
+    process.stderr._handle.setBlocking(true);
+}
+
+function log(msg) {
+    const t = new Date().toISOString().slice(11, 19);
+    process.stdout.write(`[${t}] ${msg}\n`);
+}
+function logErr(msg) {
+    const t = new Date().toISOString().slice(11, 19);
+    process.stderr.write(`[${t}] ${msg}\n`);
+}
 
 // -----------------------------------------------------------------------------
 // Minimal protobuf encode/decode (the two messages we touch are tiny).
@@ -200,19 +218,21 @@ function writeCsv(filepath, rows, columns) {
 // -----------------------------------------------------------------------------
 
 async function main() {
+    log("resolver starting");
     const configPath = process.argv[2];
     if (!configPath) {
-        console.error("usage: node resolve_seeds.js <config.json>");
+        logErr("usage: node resolve_seeds.js <config.json>");
         process.exit(2);
     }
+    log(`reading config: ${configPath}`);
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
     if (!config.input || !config.output) {
-        console.error("config requires 'input' and 'output' fields");
+        logErr("config requires 'input' and 'output' fields");
         process.exit(2);
     }
     const inputRows = readCsv(path.resolve(config.input));
-    console.log(`[resolver] ${inputRows.length} listings to inspect from ${config.input}`);
+    log(`loaded ${inputRows.length} listings from ${config.input}`);
     if (!inputRows.length) {
         writeCsv(config.output, [], ["listing_id", "seed"]);
         process.exit(0);
@@ -220,9 +240,15 @@ async function main() {
 
     const delay_ms = Number(config.request_delay_ms ?? 2500);
 
-    const client = new SteamUser({
-        dataDirectory: path.join(path.dirname(configPath), ".steam-user-data"),
-    });
+    // Persist session between runs so Steam Guard isn't needed every time.
+    // Default to ~/.bloodscope-steam but allow override via config.
+    const defaultDataDir = path.join(
+        process.env.HOME || process.env.USERPROFILE || ".", ".bloodscope-steam");
+    const dataDir = config.data_dir || defaultDataDir;
+    try { fs.mkdirSync(dataDir, { recursive: true }); } catch (_) {}
+    log(`steam-user dataDirectory: ${dataDir}`);
+
+    const client = new SteamUser({ dataDirectory: dataDir });
 
     const loginDetails = {
         accountName: config.username,
@@ -235,51 +261,77 @@ async function main() {
     let tf2Ready = false;
     const gcQueue = [];
 
+    // Watchdog -- if the whole pipeline stalls for a minute, print why.
+    let lastProgress = Date.now();
+    const watchdog = setInterval(() => {
+        const idle = Math.floor((Date.now() - lastProgress) / 1000);
+        if (idle >= 30) {
+            log(`(still running, ${idle}s since last event; ` +
+                `tf2Ready=${tf2Ready}, gcQueue=${gcQueue.length})`);
+        }
+    }, 15000);
+
     client.on("error", (err) => {
-        console.error(`[steam-user] error: ${err.message}`);
+        logErr(`steam-user error: ${err.message}`);
+        clearInterval(watchdog);
         process.exit(1);
     });
 
-    client.on("steamGuard", (domain, cb) => {
+    client.on("disconnected", (eresult, msg) => {
+        logErr(`steam-user disconnected: eresult=${eresult} ${msg || ""}`);
+    });
+
+    client.on("steamGuard", (domain, cb, lastCodeWrong) => {
         const where = domain ? `email (${domain})` : "mobile app";
-        console.error(`[steam-user] Steam Guard required via ${where}.`);
-        console.error("            Put the code in config.two_factor_code and rerun.");
+        if (lastCodeWrong) logErr("previous Steam Guard code was rejected");
+        logErr(`Steam Guard required via ${where}.`);
+        logErr("  Put a fresh code in config.two_factor_code (or --steam-2fa) and rerun.");
+        clearInterval(watchdog);
         process.exit(1);
     });
 
     client.on("loggedOn", () => {
-        console.log(`[steam-user] logged in as ${client.steamID.getSteamID64()}`);
+        lastProgress = Date.now();
+        log(`Steam login OK (${client.steamID.getSteamID64()})`);
+        log("setting game to TF2 (appid 440)");
         client.setPersona(SteamUser.EPersonaState.Online);
         client.gamesPlayed([440]);
-        console.log("[steam-user] playing TF2, waiting for GC welcome...");
     });
 
     client.on("appLaunched", (app) => {
-        if (app === 440) console.log("[steam-user] TF2 launched");
+        if (app === 440) {
+            lastProgress = Date.now();
+            log("TF2 launched, waiting for GC welcome");
+        }
     });
 
     // TF2 GC welcome message
     client.on("receivedFromGC", (appid, msgType, payload) => {
         if (appid !== 440) return;
+        lastProgress = Date.now();
         if (msgType === 4004) {          // k_EMsgGCClientWelcome
             if (!tf2Ready) {
                 tf2Ready = true;
-                console.log("[TF2 GC] received welcome, starting inspect loop");
+                log(`TF2 GC welcome received (payload ${payload.length} bytes), ` +
+                    "starting inspect loop");
                 runInspectLoop().catch(err => {
-                    console.error(`[resolver] fatal: ${err.stack || err.message}`);
+                    logErr(`fatal: ${err.stack || err.message}`);
+                    clearInterval(watchdog);
                     process.exit(1);
                 });
             }
         } else if (msgType === 6403) {   // Preview data block response
-            // Dispatch to whichever promise is waiting
             const pending = gcQueue.shift();
             if (pending) pending.resolve(payload);
+            else log(`WARN: GC 6403 received with empty queue (${payload.length} bytes)`);
         }
     });
 
     async function inspectOne(req) {
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error("GC timeout")), 15000);
+            const timer = setTimeout(
+                () => reject(new Error("GC inspect timeout (15s no reply)")),
+                15000);
             gcQueue.push({
                 resolve: (buf) => { clearTimeout(timer); resolve(buf); },
                 reject:  (err) => { clearTimeout(timer); reject(err); },
@@ -291,43 +343,57 @@ async function main() {
 
     async function runInspectLoop() {
         const results = [];
+        log(`starting ${inputRows.length} inspect requests (${delay_ms} ms between)`);
+        const t0 = Date.now();
         for (let i = 0; i < inputRows.length; i++) {
             const row = inputRows[i];
             const lid = row.listing_id || row.listingid || "";
             const url = row.inspect_url || row.inspect || "";
             const parsed = parseInspectUrl(url);
+            const tag = `[${i + 1}/${inputRows.length}]`;
             if (!parsed) {
-                console.log(`  [${i + 1}/${inputRows.length}] ${lid}  BAD URL`);
+                log(`${tag} ${lid}  BAD URL, skipping`);
                 results.push({ listing_id: lid, seed: "" });
                 continue;
             }
+            const paramsStr = `S=${parsed.paramS} A=${parsed.paramA} ` +
+                              `D=${parsed.paramD} M=${parsed.paramM}`;
+            log(`${tag} ${lid}  sending inspect (${paramsStr})`);
             try {
-                const resp   = await inspectOne(parsed);
-                // Navigate: CMsgResponse.iteminfo(1) -> CEconItemPreviewDataBlock.econitem(1)
-                //          -> CSOEconItem.original_id(16)
+                const t = Date.now();
+                const resp = await inspectOne(parsed);
+                lastProgress = Date.now();
+                const ms   = Date.now() - t;
                 const seed = extractVarintAtPath(resp, [1, 1, 16]);
                 if (seed == null) {
-                    console.log(`  [${i + 1}/${inputRows.length}] ${lid}  no original_id in response`);
+                    // Dump first 64 hex bytes of the response for debugging
+                    const hex = resp.slice(0, 64).toString("hex");
+                    log(`${tag} ${lid}  reply in ${ms}ms but NO original_id; ` +
+                        `resp[0..64]=${hex}...`);
                     results.push({ listing_id: lid, seed: "" });
                 } else {
-                    console.log(`  [${i + 1}/${inputRows.length}] ${lid}  seed=${seed}`);
+                    log(`${tag} ${lid}  seed=${seed} (${ms}ms)`);
                     results.push({ listing_id: lid, seed: seed.toString() });
                 }
             } catch (err) {
-                console.log(`  [${i + 1}/${inputRows.length}] ${lid}  error: ${err.message}`);
+                log(`${tag} ${lid}  ERROR: ${err.message}`);
                 results.push({ listing_id: lid, seed: "" });
             }
             if (i + 1 < inputRows.length) {
                 await new Promise(r => setTimeout(r, delay_ms));
             }
         }
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
         writeCsv(path.resolve(config.output), results, ["listing_id", "seed"]);
         const ok = results.filter(r => r.seed).length;
-        console.log(`[resolver] wrote ${config.output} (${ok}/${results.length} resolved)`);
+        log(`DONE. ${ok}/${results.length} resolved in ${elapsed}s`);
+        log(`wrote ${config.output}`);
+        clearInterval(watchdog);
         client.logOff();
         setTimeout(() => process.exit(0), 1000);
     }
 
+    log(`logging in as ${config.username}${config.two_factor_code ? " with 2FA" : ""}`);
     client.logOn(loginDetails);
 }
 

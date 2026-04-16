@@ -338,9 +338,26 @@ def run_auto_resolver(unresolved_rows: list[dict],
         est_sec = (request_delay_ms / 1000.0) * max(1, len(unresolved_rows))
         print(f"  spawning Node.js resolver (≈{est_sec:.0f}s estimated "
               f"for {len(unresolved_rows)} items)...")
-        rc = subprocess.run(
+        print(f"  > node {RESOLVER_JS.name} <config.json>")
+        print(f"  (resolver output streams live below)")
+        print("  " + "-" * 70)
+        sys.stdout.flush()
+
+        # Stream Node's stdout+stderr to our stdout line-by-line so the
+        # user sees progress as each request goes out.
+        proc = subprocess.Popen(
             [node, str(RESOLVER_JS), str(config)],
-        ).returncode
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,              # line buffered
+            universal_newlines=True,
+            env={**os.environ, "NODE_NO_WARNINGS": "1"},
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print("  | " + line.rstrip(), flush=True)
+        rc = proc.wait()
+        print("  " + "-" * 70)
         if rc != 0:
             print(f"  WARNING: resolver exited with code {rc}", file=sys.stderr)
 
