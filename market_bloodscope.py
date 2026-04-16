@@ -177,22 +177,96 @@ def fetch_product_listings(session, product_id: int, product_url: str,
 
 
 # -- Seed resolution ----------------------------------------------------------
+# Bumping this invalidates cached seeds from older versions of the tool.
+# v1: original_id (WRONG for tool-applied warpaints)
+# v2: custom_paintkit_seed / attrs 866+867 (correct for live TF2)
+SEED_CACHE_VERSION = 2
+
+
 def _load_seed_cache() -> dict:
-    if SEED_CACHE_PATH.exists():
-        try:
-            return json.loads(SEED_CACHE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+    if not SEED_CACHE_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(SEED_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    # Expect {"_version": N, "entries": {...}} for new caches; legacy format
+    # was {inspect_url: {"seed": ...}} with no version key.
+    if isinstance(raw, dict) and raw.get("_version") == SEED_CACHE_VERSION:
+        return raw.get("entries") or {}
+    # Old format or older version -- discard and start fresh.
+    print(f"  cache version mismatch (found v{raw.get('_version') if isinstance(raw, dict) else '?'}, "
+          f"need v{SEED_CACHE_VERSION}); discarding stale entries")
     return {}
 
 
 def _save_seed_cache(cache: dict) -> None:
+    payload = {"_version": SEED_CACHE_VERSION, "entries": cache}
     SEED_CACHE_PATH.write_text(
-        json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _extract_seed(econitem: dict) -> int | None:
+    """Pick the right `paint_kit_seed` field off a CSOEconitem.
+
+    Priority:
+      1) `custom_paintkit_seed` (already-combined u64 of attrs 866 lo + 867 hi).
+         This is what the live-game compositor uses for tool-applied war paints.
+      2) Manually assemble from `attribute[]` def_indices 866/867 if the helper
+         field is absent.
+      3) Fall back to `original_id` for native crate-dropped items where no
+         custom seed was written (the weapon's creation asset_id doubled as the
+         paint seed in the pre-2020 code path).
+
+    Returns None if nothing usable is present.
+    """
+    if not econitem:
+        return None
+
+    # 1) helper field (int-as-string, arbitrary precision)
+    cps = econitem.get("custom_paintkit_seed")
+    if cps not in (None, "", 0, "0"):
+        try:
+            return int(cps)
+        except (TypeError, ValueError):
+            pass
+
+    # 2) assemble from raw attributes
+    lo = hi = None
+    for attr in econitem.get("attribute") or []:
+        di = attr.get("def_index")
+        vb = (attr.get("value_bytes") or {}).get("data")
+        if not vb or len(vb) < 4:
+            continue
+        # value_bytes is always a little-endian u32 for these two attributes
+        u32 = vb[0] | (vb[1] << 8) | (vb[2] << 16) | (vb[3] << 24)
+        if di == 866:
+            lo = u32
+        elif di == 867:
+            hi = u32
+    if lo is not None:
+        return ((hi or 0) << 32) | lo
+
+    # 3) fall back to original_id
+    oid = econitem.get("original_id")
+    if oid not in (None, "", 0, "0"):
+        try:
+            return int(oid)
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def resolve_seed(inspect_url: str, session) -> int | None:
-    """GET inspecttf2.accurateskins.com and pull original_id = paint_kit_seed."""
+    """GET inspecttf2.accurateskins.com and extract paint_kit_seed.
+
+    See _extract_seed() for field priority. Live TF2 assembles the seed from
+    attributes 866 (lo) + 867 (hi); the accurateskins API surfaces this as
+    `custom_paintkit_seed`. We used to return `original_id` which is only
+    correct for a subset of items (native crate drops where no paint tool
+    was applied); for tool-painted items it gives a completely unrelated
+    u32 number (the weapon's creation asset_id).
+    """
     for attempt in range(3):
         try:
             r = session.get(INSPECT_API, params={"url": inspect_url},
@@ -205,10 +279,7 @@ def resolve_seed(inspect_url: str, session) -> int | None:
             body = r.json()
             if not body.get("success"):
                 return None
-            oid = body.get("item", {}).get("econitem", {}).get("original_id")
-            if oid is None:
-                return None
-            return int(oid)
+            return _extract_seed(body.get("item", {}).get("econitem"))
         except Exception:
             time.sleep(2 * (attempt + 1))
     return None
