@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code project memory
+.claude/
+
+# Generated outputs (re-created by running the scripts)
+output/
+
+# Exploratory / local-only (not part of the public repo)
+_textures_preview/
+_paintkits_master.txt
