@@ -269,3 +269,22 @@ DEF_INDEX_TO_PAINT_INDEX: dict[int, int] = {
      15157: 83,
      15158: 84,
 }
+
+# Paintkits we've verified DO NOT render paint_blood.
+# Only listings whose paint_index is in this set are hard-skipped
+# as non-blood. Everything else (including unnamed community
+# paintkits) gets measured with a default scale range (0.4, 0.5).
+NON_BLOOD_PAINT_INDICES: dict[int, str] = {
+       0: 'Paintkit',
+      61: 'harvest_flamethrower_nutcracker',
+      64: 'harvest_knife_boneyard',
+      66: 'pyroland_flamethrower_balloonicorn',
+      70: 'pyroland_rocketlauncher_braincandy',
+      72: 'pyroland_scattergun_flowerpower',
+      76: 'gentlemanne_rocketlauncher_coffinnail',
+      80: 'warbird_grenadelauncher_warhawk',
+      81: 'warbird_stickybomblauncher_blitzkrieg',
+      82: 'warbird_sniperrifle_airwolf',
+      83: 'warbird_medigun_corsair',
+      84: 'warbird_grenadelauncher_butcherbird',
+}

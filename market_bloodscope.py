@@ -57,7 +57,14 @@ from paint_blood_circle_coverage import measure_coverage_fast  # noqa: E402
 from paint_blood_paintkits import (                               # noqa: E402
     BLOOD_PAINT_INDICES,
     DEF_INDEX_TO_PAINT_INDEX,
+    NON_BLOOD_PAINT_INDICES,
 )
+
+# Default scale range used for community paintkits whose name we can't
+# match against the master schema. 610 / 632 master paintkits DO render
+# paint_blood and (0.4, 0.5) is the most common scale range, so this is
+# a reasonable best guess.
+DEFAULT_BLOOD_SCALE = (0.4, 0.5)
 
 
 # -- Config --------------------------------------------------------------------
@@ -331,6 +338,11 @@ def main():
                    help="Seconds between inspect-API calls (default 1.0).")
     p.add_argument("--threshold", type=float, default=0.20,
                    help="Darkness threshold for 'bloody' pixel.")
+    p.add_argument("--verified-only", action="store_true",
+                   help="Only include listings whose paintkit is in the "
+                        "verified BLOOD_PAINT_INDICES set. Skips community "
+                        "paintkits where the scale_uv range is inferred "
+                        "(less accurate).")
     p.add_argument("--out", type=Path, default=Path("market_bloodscopes.csv"))
     args = p.parse_args()
 
@@ -431,49 +443,70 @@ def main():
         _save_seed_cache(cache)
         print(f"      resolved in {time.time() - t0:.1f}s")
 
-        # Only compute bloodscope for listings whose paintkit is in
-        # BLOOD_PAINT_INDICES (visibly renders paint_blood with our
-        # compatible UV transform). The per-wear scale_uv range is
-        # paintkit-specific (Harvest uses 0.4-0.5, Night Owl 0.6-0.7, etc.)
-        # and we thread it through measure_coverage_fast.
-        print("[4/4] computing bloodscope coverage for BLOOD paintkits "
-              "(fast path, paintkit-specific scale)...")
+        # Three-way paint_index classification:
+        #   * BLOOD_PAINT_INDICES: verified blood paintkit with known
+        #     scale_uv per wear; use that scale for maximum accuracy.
+        #   * NON_BLOOD_PAINT_INDICES: verified non-blood (e.g. Bamboo
+        #     Brushed). Skip -- the math would produce a phantom number.
+        #   * Everything else (community paintkits with generic "Paintkit
+        #     N" names in items_game): compute with DEFAULT_BLOOD_SCALE.
+        #     610/632 master paintkits DO composite blood, so treating
+        #     these as blood-candidates is the right default. Mark them
+        #     `is_blood_paintkit='inferred'` so downstream users know the
+        #     scale_uv guess might be slightly off.
+        print("[4/4] computing bloodscope coverage "
+              "(verified + inferred paintkits, fast path)...")
         t0 = time.time()
         skipped_non_blood = 0
+        inferred = 0
+        verified = 0
         for l in listings:
             if not l.get("seed"):
                 continue
             pi = l.get("paint_index")
-            blood = BLOOD_PAINT_INDICES.get(pi) if pi is not None else None
-            if blood is None:
+            if pi is not None and pi in NON_BLOOD_PAINT_INDICES:
                 l["ft_pct"] = None
                 l["bs_pct"] = None
                 l["is_blood_paintkit"] = False
+                l["paintkit_name"] = NON_BLOOD_PAINT_INDICES[pi]
                 skipped_non_blood += 1
                 continue
-            name, per_wear = blood
-            l["is_blood_paintkit"] = True
-            l["paintkit_name"]     = name
-            try:
-                # For FT wear (wear 3): use its scale_uv range + texture.
-                # For BS wear (wear 5 -- same as WW=4): use its range.
-                # Most paintkits have identical scale at both wears, but we
-                # look each up independently to be safe.
+            blood = BLOOD_PAINT_INDICES.get(pi) if pi is not None else None
+            if blood is not None:
+                name, per_wear = blood
+                l["is_blood_paintkit"] = True
+                l["paintkit_name"]     = name
                 ft_info = per_wear.get(3)
                 bs_info = per_wear.get(5) or per_wear.get(4)
+                verified += 1
+            else:
+                if args.verified_only:
+                    # User wants accuracy -- skip unverified.
+                    l["ft_pct"] = None
+                    l["bs_pct"] = None
+                    l["is_blood_paintkit"] = "inferred"
+                    l["paintkit_name"]     = f"(unverified, paint_index {pi})"
+                    inferred += 1
+                    continue
+                # Unknown / community paintkit -- infer as blood with
+                # default scale at both wears.
+                l["is_blood_paintkit"] = "inferred"
+                l["paintkit_name"]     = f"(unverified, paint_index {pi})"
+                ft_info = (DEFAULT_BLOOD_SCALE[0], DEFAULT_BLOOD_SCALE[1], "paint_blood")
+                bs_info = (DEFAULT_BLOOD_SCALE[0], DEFAULT_BLOOD_SCALE[1], "paint_blood_buckets")
+                inferred += 1
+            try:
                 if ft_info is not None:
-                    ft_scale = (ft_info[0], ft_info[1])
                     ft_pct, _ = measure_coverage_fast(
                         l["seed"], threshold=args.threshold,
-                        scale_range=ft_scale)
+                        scale_range=(ft_info[0], ft_info[1]))
                     l["ft_pct"] = round(ft_pct, 2)
                 else:
                     l["ft_pct"] = None
                 if bs_info is not None:
-                    bs_scale = (bs_info[0], bs_info[1])
                     _, bs_pct = measure_coverage_fast(
                         l["seed"], threshold=args.threshold,
-                        scale_range=bs_scale)
+                        scale_range=(bs_info[0], bs_info[1]))
                     l["bs_pct"] = round(bs_pct, 2)
                 else:
                     l["bs_pct"] = None
@@ -482,7 +515,8 @@ def main():
                 l["ft_pct"] = None
                 l["bs_pct"] = None
         print(f"      done in {time.time() - t0:.2f}s  "
-              f"({skipped_non_blood} non-blood paintkit(s) skipped)")
+              f"(verified={verified}, inferred={inferred}, "
+              f"non-blood skipped={skipped_non_blood})")
 
     # Output CSV
     columns = ["mannco_id", "product_name", "wear_name", "price_cents",
@@ -507,25 +541,28 @@ def main():
                 return max(r.get("ft_pct") or 0, r.get("bs_pct") or 0)
             resolved.sort(key=_score, reverse=True)
             print(f"\n=== Top bloodscopes "
-                  f"({len(resolved)} blood-paintkit listings resolved) ===")
+                  f"({len(resolved)} listings with visible blood) ===")
             print(f"  {'wear':16s}  {'FT%':>6s}  {'BS%':>6s}  "
-                  f"{'price':>8s}  {'seed':>20s}  mannco page")
+                  f"{'inf':>3s}  {'price':>8s}  {'seed':>20s}  mannco page")
             for l in resolved[:25]:
                 ft = l.get("ft_pct")
                 bs = l.get("bs_pct")
                 ft_s = f"{ft:6.2f}" if ft is not None else "    --"
                 bs_s = f"{bs:6.2f}" if bs is not None else "    --"
+                inf = "?" if l.get("is_blood_paintkit") == "inferred" else " "
                 print(f"  {l['wear_name']:16s}  {ft_s}  {bs_s}  "
-                      f"${l['price_cents']/100:6.2f}  {l['seed']:>20d}  "
-                      f"{l['mannco_page_url']}")
+                      f"{inf:>3s}  ${l['price_cents']/100:6.2f}  "
+                      f"{l['seed']:>20d}  {l['mannco_page_url']}")
+            print("  ('?' = paintkit name unknown -- scale range inferred as "
+                  "(0.4, 0.5). Numbers may be slightly off for paintkits that "
+                  "use a different scale_uv range.)")
 
-        # Show how many listings were skipped because their paintkit isn't
-        # blood-compatible (so the user knows WHY only a subset resolved).
         non_blood = [l for l in listings
-                     if l.get("seed") is not None and not l.get("is_blood_paintkit")]
+                     if l.get("seed") is not None
+                     and l.get("is_blood_paintkit") is False]
         if non_blood:
-            print(f"\n  ({len(non_blood)} listing(s) skipped: paintkit isn't in "
-                  f"BLOOD_PAINT_INDICES -- wrong UV transform or no visible blood)")
+            print(f"\n  ({len(non_blood)} listing(s) skipped as verified NON-blood "
+                  f"paintkits -- e.g. Bamboo Brushed, Civic Duty)")
 
 
 if __name__ == "__main__":

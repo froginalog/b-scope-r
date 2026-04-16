@@ -108,6 +108,52 @@ def _child(block, key, default=None):
 
 
 # -----------------------------------------------------------------------------
+# Variable substitution: community paintkits (c01_*, c02_*, c03_*, c04_*) use
+# templated strings like `"texture" "$[texture_blood]"` with variables declared
+# nearby as `"$texture_blood" "patterns/paint_blood"`. We need to resolve these
+# before checking whether the paintkit uses paint_blood visibly.
+# -----------------------------------------------------------------------------
+_VAR_REF_RE = re.compile(r'\$\[([A-Za-z_][A-Za-z0-9_]*)\]')
+
+
+def _collect_vars(block, out: dict[str, str] | None = None) -> dict[str, str]:
+    """Recursively collect `"$name" "value"` pairs from a KV tree. The value
+    itself may contain `$[other]` references; we resolve them lazily so
+    ordering of declarations doesn't matter."""
+    if out is None:
+        out = {}
+    if not isinstance(block, list):
+        return out
+    for k, v in block:
+        if isinstance(k, str) and k.startswith("$") and isinstance(v, str):
+            out[k[1:]] = v
+        elif isinstance(v, list):
+            _collect_vars(v, out)
+    return out
+
+
+def _resolve(value: str, vars_: dict[str, str], depth: int = 0) -> str:
+    """Expand `$[name]` references; fall back to the raw literal if the var
+    isn't defined. Caps recursion to avoid pathological templates."""
+    if not isinstance(value, str) or depth > 8:
+        return value
+    def repl(m):
+        name = m.group(1)
+        if name in vars_:
+            return _resolve(vars_[name], vars_, depth + 1)
+        return m.group(0)       # leave unresolved token as-is
+    return _VAR_REF_RE.sub(repl, value)
+
+
+def _rchild(block, key, vars_: dict[str, str], default=None):
+    """Like _child but resolves $[var] references in the returned string."""
+    v = _child(block, key, default)
+    if isinstance(v, str):
+        return _resolve(v, vars_)
+    return v
+
+
+# -----------------------------------------------------------------------------
 # Paintkits master: walk each wear's compositor tree
 # -----------------------------------------------------------------------------
 def _iter_top_level_paintkits(text: str):
@@ -153,19 +199,15 @@ def _iter_top_level_paintkits(text: str):
         i += 1
 
 
-def _is_blood_texture(tl_body) -> bool:
-    t = _child(tl_body, "texture", "") or ""
+def _is_blood_texture(tl_body, vars_: dict[str, str]) -> bool:
+    t = _rchild(tl_body, "texture", vars_, "") or ""
     return t in BLOOD_TEXTURES
 
 
-def _adjust_offset_visible(tl_body) -> bool:
-    off = _child(tl_body, "adjust_offset")
-    if off is None:
-        # Default is 0 -- blood invisible
+def _adjust_offset_visible(tl_body, vars_: dict[str, str]) -> bool:
+    off = _rchild(tl_body, "adjust_offset", vars_)
+    if off is None or not isinstance(off, str):
         return False
-    if not isinstance(off, str):
-        return False
-    # Can be "N" or "MIN MAX". Visible if any token parses as non-zero.
     for tok in off.split():
         try:
             if float(tok) != 0.0:
@@ -175,7 +217,7 @@ def _adjust_offset_visible(tl_body) -> bool:
     return False
 
 
-def _harvest_compatible_core(tl_body) -> bool:
+def _harvest_compatible_core(tl_body, vars_: dict[str, str]) -> bool:
     """Same translate/rotation ranges as Harvest. Scale is handled
     separately (returned per-paintkit so compute_blood_uv can be called
     with the right range)."""
@@ -185,13 +227,12 @@ def _harvest_compatible_core(tl_body) -> bool:
         "rotation":    "0 360",
     }
     for key, want in checks.items():
-        got = _child(tl_body, key)
+        got = _rchild(tl_body, key, vars_)
         if not isinstance(got, str):
             return False
         if got.split() != want.split():
             return False
-    # scale_uv must be present and parseable as 1 or 2 floats
-    sc = _child(tl_body, "scale_uv")
+    sc = _rchild(tl_body, "scale_uv", vars_)
     if not isinstance(sc, str):
         return False
     parts = sc.split()
@@ -205,8 +246,8 @@ def _harvest_compatible_core(tl_body) -> bool:
     return True
 
 
-def _scale_range(tl_body) -> tuple[float, float] | None:
-    sc = _child(tl_body, "scale_uv")
+def _scale_range(tl_body, vars_: dict[str, str]) -> tuple[float, float] | None:
+    sc = _rchild(tl_body, "scale_uv", vars_)
     if not isinstance(sc, str):
         return None
     parts = sc.split()
@@ -222,29 +263,29 @@ def _scale_range(tl_body) -> tuple[float, float] | None:
 
 
 def _walk_visible_blood_with_scale(
-    node, inside_select: bool,
+    node, inside_select: bool, vars_: dict[str, str],
 ) -> tuple[float, float, str] | None:
     """Recursively walk the KV tree; return (scale_min, scale_max,
     texture_suffix) of the FIRST visible paint_blood texture_lookup
-    (outside any `select`), where texture_suffix is 'paint_blood' or
-    'paint_blood_buckets'. None if no visible blood layer."""
+    (outside any `select`). Variable references in texture/adjust_offset/
+    scale_uv are resolved via `vars_`."""
     if not isinstance(node, list):
         return None
     for k, v in node:
         if k == "select":
             continue
         if k == "texture_lookup" and not inside_select:
-            if (_is_blood_texture(v)
-                    and _adjust_offset_visible(v)
-                    and _harvest_compatible_core(v)):
-                rng = _scale_range(v)
+            if (_is_blood_texture(v, vars_)
+                    and _adjust_offset_visible(v, vars_)
+                    and _harvest_compatible_core(v, vars_)):
+                rng = _scale_range(v, vars_)
                 if rng is None:
                     continue
-                tex = _child(v, "texture", "") or ""
+                tex = _rchild(v, "texture", vars_, "") or ""
                 suffix = tex.rsplit("/", 1)[-1]
                 return (rng[0], rng[1], suffix)
         if isinstance(v, list):
-            got = _walk_visible_blood_with_scale(v, inside_select)
+            got = _walk_visible_blood_with_scale(v, inside_select, vars_)
             if got is not None:
                 return got
     return None
@@ -252,14 +293,24 @@ def _walk_visible_blood_with_scale(
 
 def paintkit_bloody_wears(body_text: str) -> dict[int, tuple[float, float, str]]:
     """Return {wear: (scale_min, scale_max, texture_suffix)} for each wear
-    that has a visible, UV-compatible paint_blood layer."""
+    that has a visible, UV-compatible paint_blood layer. Supports
+    community paintkits that use `$[var]` template references -- vars
+    are collected from both the paintkit-level scope and the wear-level
+    scope (wear-level shadows paintkit-level)."""
     parsed = parse_kv(body_text)
+    paintkit_vars = _collect_vars(parsed)
+
     out: dict[int, tuple[float, float, str]] = {}
     for wear in (3, 4, 5):
         wblock = _child(parsed, f"wear_level_{wear}")
         if not wblock:
             continue
-        info = _walk_visible_blood_with_scale(wblock, inside_select=False)
+        # Local-scope vars (wear-specific) shadow paintkit-global ones.
+        wear_vars = dict(paintkit_vars)
+        wear_vars.update(_collect_vars(wblock))
+        info = _walk_visible_blood_with_scale(
+            wblock, inside_select=False, vars_=wear_vars,
+        )
         if info is not None:
             out[wear] = info
     return out
@@ -391,6 +442,20 @@ def main():
 
     print(f"\n[final] {len(idx_to_info)} paint_indices qualify as blood paintkits")
 
+    # Also emit the EXPLICIT non-blood set: paint_indices whose master
+    # entry we DID find (so we know the name) but that don't show visible
+    # blood. These are the only paint_indices we'll hard-skip; anything
+    # else (community paintkits with generic "Paintkit N" names, etc.)
+    # gets treated as a blood candidate with default scale (0.4, 0.5).
+    non_blood: dict[int, str] = {}
+    for name, idx in sorted(name_to_idx.items()):
+        if name in bloody_by_name:
+            continue
+        # A paintkit is in items_game but doesn't have a visible blood
+        # layer in master -> explicitly non-blood.
+        non_blood.setdefault(idx, name)
+    print(f"[final] {len(non_blood)} explicit NON-blood paint_indices (e.g. Bamboo Brushed)")
+
     expectations = [
         (64,  True,  "harvest_*_boneyard family"),
         (306, False, "Bamboo Brushed (NOT blood)"),
@@ -462,6 +527,23 @@ def main():
     lines.append("DEF_INDEX_TO_PAINT_INDEX: dict[int, int] = {")
     for d in sorted(def_to_idx):
         lines.append(f"    {d:>6}: {def_to_idx[d]},")
+    lines.append("}")
+
+    # Third map: EXPLICIT non-blood paint_indices. These are paintkits we
+    # affirmatively know DON'T render paint_blood (based on reading the
+    # master compositor tree). Anything NOT in BLOOD_PAINT_INDICES and NOT
+    # in NON_BLOOD_PAINT_INDICES is treated by market_bloodscope.py as a
+    # community paintkit and measured with a default scale range -- since
+    # 610/632 paintkits in master DO composite blood, the default is to
+    # assume blood and fall back to an explicit non-blood deny list.
+    lines.append("")
+    lines.append("# Paintkits we've verified DO NOT render paint_blood.")
+    lines.append("# Only listings whose paint_index is in this set are hard-skipped")
+    lines.append("# as non-blood. Everything else (including unnamed community")
+    lines.append("# paintkits) gets measured with a default scale range (0.4, 0.5).")
+    lines.append("NON_BLOOD_PAINT_INDICES: dict[int, str] = {")
+    for idx in sorted(non_blood):
+        lines.append(f"    {idx:>4}: {non_blood[idx]!r},")
     lines.append("}")
 
     OUT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
