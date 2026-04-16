@@ -15,7 +15,11 @@ venv/
 
 # Generated outputs (re-created by running the scripts)
 output/
+rust_bloodscope/bloodscope_out/
+rust_bloodscope/target/
 
 # Exploratory / local-only (not part of the public repo)
 _textures_preview/
 _paintkits_master.txt
+verify_out/
+verify_out_small/
