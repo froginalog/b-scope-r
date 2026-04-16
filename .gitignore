@@ -23,3 +23,6 @@ _textures_preview/
 _paintkits_master.txt
 verify_out/
 verify_out_small/
+market_bloodscopes.csv
+test_market.csv
+test_seeds.csv
