@@ -565,16 +565,25 @@ def main():
             # Already sorted by blood_score (done above). Show them all.
             print(f"\n=== All bloodscopes ({len(resolved)} listings, ranked by "
                   f"own-wear coverage) ===")
-            print(f"  {'score':>6s}  {'wear':16s}  {'inf':>3s}  "
-                  f"{'price':>8s}  {'seed':>20s}  mannco page")
+            print(f"  {'score':>6s}  {'FT%':>6s}  {'BS%':>6s}  {'wear':16s}  "
+                  f"{'inf':>3s}  {'price':>8s}  {'seed':>20s}  {'paintkit':30s}  mannco page")
             for l in resolved:
-                sc = l.get("blood_score") or 0.0
-                inf = "?" if l.get("is_blood_paintkit") == "inferred" else " "
-                print(f"  {sc:6.2f}  {l['wear_name']:16s}  {inf:>3s}  "
-                      f"${l['price_cents']/100:6.2f}  "
-                      f"{l['seed']:>20d}  {l['mannco_page_url']}")
+                sc  = l.get("blood_score") or 0.0
+                ft  = l.get("ft_pct")
+                bs  = l.get("bs_pct")
+                ft_s = f"{ft:6.2f}" if ft is not None else "    --"
+                bs_s = f"{bs:6.2f}" if bs is not None else "    --"
+                inf  = "?" if l.get("is_blood_paintkit") == "inferred" else " "
+                pkn  = (l.get("paintkit_name") or "").replace(
+                    "(unverified, paint_index ", "pi=").rstrip(")")
+                print(f"  {sc:6.2f}  {ft_s}  {bs_s}  {l['wear_name']:16s}  "
+                      f"{inf:>3s}  ${l['price_cents']/100:6.2f}  "
+                      f"{l['seed']:>20d}  {pkn:30.30s}  "
+                      f"{l['mannco_page_url']}")
             print("  'score' = coverage on the blood pattern THIS wear uses")
             print("           (FT -> paint_blood, WW/BS -> paint_blood_buckets)")
+            print("  'FT%/BS%' = raw coverage under each pattern; 'score' picks "
+                  "the one that matches the listing's wear")
             print("  '?'     = community paintkit, scale range inferred as "
                   "(0.4, 0.5) so the number may be slightly off")
 
