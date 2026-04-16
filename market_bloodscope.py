@@ -16,38 +16,47 @@ Pipeline
      the README).
   5. Write a ranked CSV and print a summary.
 
-Limitation: Steam's Market API does NOT expose paint_kit_seed in listing
-JSON. The seed lives on the TF2 Game Coordinator and must be fetched via a
-GC inspect request (which requires a logged-in Steam account running a
-TF2-capable client). This script handles everything up to and after the
-GC query, but the query itself is left to external tooling:
+Seed resolution
+---------------
+Steam's Market API does NOT expose paint_kit_seed in listing data. The
+seed is stored on the TF2 Game Coordinator as CSOEconItem.original_id.
 
-  - Manually: open each inspect URL in your TF2 client, then read the
-    pattern/seed number shown in-game.
-  - Automated: run a Steam GC bot (e.g. node-steam-user + node-tf2) that
-    takes inspect URLs and emits listing_id,seed CSV rows -- then feed
-    that CSV back in via --seeds-csv.
+Rather than run our own Steam bot (Valve's Subscriber Agreement forbids
+using automation software to interact with Steam, which would put your
+account at risk), this script calls a free public third-party service
+that already maintains the inspect infrastructure:
+
+    GET https://inspecttf2.accurateskins.com/?url=<inspect_url>
+      -> { "success": true, "item": { "econitem": { "original_id": "...", ... } } }
+
+This is the backend used by the "Steam on Steroids / Accurate Skins"
+Chrome extension. No auth needed; they run the Steam client themselves
+and just expose an HTTP read-only endpoint. Responses take a few
+seconds (GC round-trip) so the script caches them to disk.
+
+Fallbacks if the API is unavailable:
+
+  --seeds-csv FILE    Pre-resolved listing_id,seed pairs from any source
+                      (your own inspection, saved runs, etc.)
+  --interactive       Open each inspect URL through your local Steam
+                      client yourself and paste the seed in.
 
 Usage
 -----
   python market_bloodscope.py "Field-Tested Harvest Sniper Rifle"
-  python market_bloodscope.py "Harvest Sniper Rifle" --count 100
-  python market_bloodscope.py "Harvest Sniper Rifle" --wears 3,4,5 \
-      --seeds-csv my_resolved_seeds.csv --out harvest_ranked.csv
+  python market_bloodscope.py "Harvest Sniper Rifle" --count 100 --auto-resolve
+  python market_bloodscope.py "Harvest Sniper Rifle" --seeds-csv my_seeds.csv
 """
 
 import argparse
 import csv
-import getpass
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
+import webbrowser
 from pathlib import Path
 
 import requests
@@ -261,109 +270,178 @@ def load_seeds_csv(path: Path) -> dict[str, int]:
     return out
 
 
-# -- Node.js resolver orchestration -------------------------------------------
-RESOLVER_DIR    = REPO_DIR / "tools"
-RESOLVER_JS     = RESOLVER_DIR / "resolve_seeds.js"
-RESOLVER_NODEMO = RESOLVER_DIR / "node_modules"
+# -- Third-party API resolver -------------------------------------------------
+INSPECT_API       = "https://inspecttf2.accurateskins.com/"
+SEED_CACHE_PATH   = REPO_DIR / ".seed_cache.json"
+API_RETRY         = 2
+API_TIMEOUT_SEC   = 30
+API_DEFAULT_DELAY = 1.0     # polite spacing between requests (seconds)
 
 
-def _ensure_resolver_installed() -> str:
-    """Locate Node.js and install tools/ dependencies if needed.
-
-    Returns the path to the node executable.
-    """
-    node = shutil.which("node")
-    if not node:
-        raise RuntimeError(
-            "node.js is required for --auto-resolve. "
-            "Install Node 18+ from https://nodejs.org and try again."
-        )
-    if not RESOLVER_JS.exists():
-        raise RuntimeError(f"resolver script missing at {RESOLVER_JS}")
-    if not RESOLVER_NODEMO.exists():
-        npm = shutil.which("npm")
-        if not npm:
-            raise RuntimeError("npm is required to install resolver deps.")
-        print(f"  installing resolver deps (first run)... ", end="", flush=True)
-        r = subprocess.run(
-            [npm, "install", "--no-audit", "--no-fund"],
-            cwd=RESOLVER_DIR, capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(f"npm install failed:\n{r.stderr}")
-        print("done.")
-    return node
-
-
-def run_auto_resolver(unresolved_rows: list[dict],
-                      username: str,
-                      password: str,
-                      two_factor: str | None,
-                      request_delay_ms: int = 2500) -> dict[str, int]:
-    """Spawn the Node.js helper to inspect listings and return listing_id -> seed.
-
-    Writes a temp inspect_urls.csv, runs node tools/resolve_seeds.js, reads
-    back the seeds.csv. Streams the helper's stdout live so the user can
-    watch progress.
-    """
-    node = _ensure_resolver_installed()
-
-    with tempfile.TemporaryDirectory(prefix="bloodscope_gc_") as tmpdir:
-        tmp = Path(tmpdir)
-        in_csv  = tmp / "inspect_urls.csv"
-        out_csv = tmp / "seeds.csv"
-        config  = tmp / "config.json"
-
-        with open(in_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["listing_id", "inspect_url"])
-            w.writeheader()
-            for r in unresolved_rows:
-                if r.get("inspect_url"):
-                    w.writerow({
-                        "listing_id":  r["listing_id"],
-                        "inspect_url": r["inspect_url"],
-                    })
-
-        cfg = {
-            "username":         username,
-            "password":         password,
-            "input":            str(in_csv),
-            "output":           str(out_csv),
-            "request_delay_ms": int(request_delay_ms),
-        }
-        if two_factor:
-            cfg["two_factor_code"] = two_factor
-        config.write_text(json.dumps(cfg), encoding="utf-8")
-
-        est_sec = (request_delay_ms / 1000.0) * max(1, len(unresolved_rows))
-        print(f"  spawning Node.js resolver (≈{est_sec:.0f}s estimated "
-              f"for {len(unresolved_rows)} items)...")
-        print(f"  > node {RESOLVER_JS.name} <config.json>")
-        print(f"  (resolver output streams live below)")
-        print("  " + "-" * 70)
-        sys.stdout.flush()
-
-        # Stream Node's stdout+stderr to our stdout line-by-line so the
-        # user sees progress as each request goes out.
-        proc = subprocess.Popen(
-            [node, str(RESOLVER_JS), str(config)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,              # line buffered
-            universal_newlines=True,
-            env={**os.environ, "NODE_NO_WARNINGS": "1"},
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            print("  | " + line.rstrip(), flush=True)
-        rc = proc.wait()
-        print("  " + "-" * 70)
-        if rc != 0:
-            print(f"  WARNING: resolver exited with code {rc}", file=sys.stderr)
-
-        if not out_csv.exists():
+def _load_seed_cache() -> dict:
+    if SEED_CACHE_PATH.exists():
+        try:
+            return json.loads(SEED_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
             return {}
-        return load_seeds_csv(out_csv)
+    return {}
+
+
+def _save_seed_cache(cache: dict) -> None:
+    SEED_CACHE_PATH.write_text(
+        json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _api_resolve_seed(inspect_url: str, session: requests.Session) -> dict | None:
+    """Call inspecttf2.accurateskins.com and return the parsed item dict, or None."""
+    params = {"url": inspect_url}
+    last_err = None
+    for attempt in range(API_RETRY):
+        try:
+            resp = session.get(INSPECT_API, params=params, timeout=API_TIMEOUT_SEC)
+            if resp.status_code == 429:
+                # Rate limited; back off
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            if not body.get("success"):
+                return None
+            return body.get("item", {}).get("econitem")
+        except requests.RequestException as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    if last_err:
+        print(f"    API error: {last_err}", file=sys.stderr)
+    return None
+
+
+def auto_resolve(unresolved_rows: list[dict],
+                 delay_sec: float = API_DEFAULT_DELAY) -> dict[str, int]:
+    """Resolve seeds for each unresolved listing via the public inspect API.
+
+    The seed used for bloodscope is CSOEconItem.original_id -- this is what
+    the TF2 compositor itself uses (c_tf_player.cpp:3893:
+        uint64 seed = pItem->GetOriginalID();
+    ). The attribute 866/867 "custom paintkit seed" value is also on the
+    response, but original_id is the one that drives the UV transform.
+
+    Responses are cached to {REPO}/.seed_cache.json keyed by listing_id so
+    repeated runs never re-hit the API for the same listing.
+    """
+    cache   = _load_seed_cache()
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "bloodscope-market (https://github.com/froginalog/b-scope-r)"
+        ),
+        "Accept": "application/json",
+    })
+    resolved: dict[str, int] = {}
+    n = len(unresolved_rows)
+    print(f"\n=== Auto-resolving {n} listings via inspecttf2.accurateskins.com ===")
+    print(f"    (cache: {SEED_CACHE_PATH})")
+    t0 = time.time()
+    for i, row in enumerate(unresolved_rows, 1):
+        lid = row["listing_id"]
+        url = row["inspect_url"]
+        if not url:
+            print(f"  [{i}/{n}] {lid}  (no inspect URL)")
+            continue
+        # Cache hit?
+        if lid in cache and cache[lid].get("seed"):
+            seed = int(cache[lid]["seed"])
+            resolved[lid] = seed
+            print(f"  [{i}/{n}] {lid}  (cached)  seed={seed}")
+            continue
+        t = time.time()
+        item = _api_resolve_seed(url, session)
+        ms = int((time.time() - t) * 1000)
+        if not item:
+            print(f"  [{i}/{n}] {lid}  ({ms} ms)  API returned no item")
+            continue
+        try:
+            seed = int(item.get("original_id", 0))
+        except (TypeError, ValueError):
+            seed = 0
+        if not seed:
+            print(f"  [{i}/{n}] {lid}  ({ms} ms)  no original_id in response")
+            continue
+        resolved[lid] = seed
+        cache[lid] = {"seed": seed, "resolved_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        print(f"  [{i}/{n}] {lid}  ({ms} ms)  seed={seed}")
+        # Persist cache periodically so a crash doesn't lose progress
+        if i % 10 == 0:
+            _save_seed_cache(cache)
+        if i < n:
+            time.sleep(delay_sec)
+    _save_seed_cache(cache)
+    elapsed = time.time() - t0
+    print(f"  resolved {len(resolved)}/{n} in {elapsed:.1f} s\n")
+    return resolved
+
+
+# -- Interactive manual resolution --------------------------------------------
+def _open_inspect_url(url: str) -> None:
+    """Hand the inspect URL to the OS so Steam + TF2 open the inspect panel.
+
+    This is exactly what happens when you click "Inspect in Game" on the
+    Steam Market web page -- the browser hands the `steam://` URL to the
+    Steam protocol handler, which launches TF2 and runs the inspect
+    command. No automation, no third-party client, no ToS concern.
+    """
+    # webbrowser.open handles steam:// URLs on all three major OSes
+    # (Windows hands them to the Steam protocol handler, macOS too, Linux
+    # via xdg-open which routes through the registered scheme).
+    webbrowser.open(url)
+
+
+def interactive_resolve(unresolved_rows: list[dict]) -> dict[str, int]:
+    """Walk the user through unresolved listings one at a time.
+
+    For each listing: opens the inspect URL through the user's real Steam
+    client, prompts them to read the pattern number from the TF2 inspect
+    panel and paste it in. Empty input skips the listing; 'q' quits the
+    loop and keeps whatever was resolved so far.
+    """
+    out: dict[str, int] = {}
+    n = len(unresolved_rows)
+    print()
+    print(f"=== Interactive seed resolution ({n} listings) ===")
+    print("Each URL will be handed to Steam, which will open the item in TF2.")
+    print("Read the pattern number shown in TF2's inspect panel and paste it.")
+    print("  [Enter] skip this one    [q] quit and keep what we have so far")
+    print()
+    for i, row in enumerate(unresolved_rows, 1):
+        lid  = row["listing_id"]
+        wear = row["wear_name"]
+        url  = row["inspect_url"]
+        price = row["price_cents"] / 100.0
+        print(f"[{i}/{n}] listing {lid}  {wear}  ${price:.2f}")
+        if not url:
+            print("  (no inspect URL on this listing, skipping)")
+            continue
+        print(f"  opening: {url}")
+        try:
+            _open_inspect_url(url)
+        except Exception as e:
+            print(f"  could not open URL automatically: {e}")
+        try:
+            raw = input("  seed (integer) > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  aborted by user")
+            break
+        if raw.lower() in ("q", "quit", "exit"):
+            print("  quit; keeping what we have so far")
+            break
+        if not raw:
+            continue
+        try:
+            out[lid] = int(raw)
+        except ValueError:
+            print(f"  '{raw}' is not an integer; skipping")
+    print()
+    return out
 
 
 # -- CLI ----------------------------------------------------------------------
@@ -388,19 +466,17 @@ def main():
                    help="Output CSV path (default market_bloodscopes.csv).")
     p.add_argument("--threshold", type=float, default=0.20,
                    help="Darkness threshold for 'bloody' pixel (default 0.20).")
-    # --auto-resolve: spawn the Node.js TF2 GC client to fetch seeds
     p.add_argument("--auto-resolve", action="store_true",
-                   help="Automatically resolve seeds via the Node.js TF2 GC "
-                        "helper (requires Steam login + Node 18+).")
-    p.add_argument("--steam-user", default=os.environ.get("STEAM_USER"),
-                   help="Steam account name (or set $STEAM_USER).")
-    p.add_argument("--steam-pass", default=os.environ.get("STEAM_PASS"),
-                   help="Steam password (or set $STEAM_PASS). Prompted if omitted.")
-    p.add_argument("--steam-2fa", default=os.environ.get("STEAM_2FA"),
-                   help="Steam Guard mobile code (or set $STEAM_2FA).")
-    p.add_argument("--gc-delay-ms", type=int, default=2500,
-                   help="Delay between GC inspect requests (default 2500 ms, "
-                        "matches the TF2 client's internal cooldown).")
+                   help="Resolve seeds via the public inspecttf2.accurateskins.com "
+                        "inspect API (no Steam login, no bot). Results are "
+                        f"cached to {SEED_CACHE_PATH.name} for subsequent runs.")
+    p.add_argument("--api-delay", type=float, default=API_DEFAULT_DELAY,
+                   help="Seconds between API calls (default 1.0).")
+    p.add_argument("--interactive", action="store_true",
+                   help="Fallback: open each unresolved inspect URL through "
+                        "your Steam client and prompt you to paste the pattern "
+                        "number. Zero automation. Used AFTER --auto-resolve if both "
+                        "are passed.")
     args = p.parse_args()
 
     wears = {int(w) for w in args.wears.split(",") if w.strip()}
@@ -457,32 +533,25 @@ def main():
             seeds_map = load_seeds_csv(args.seeds_csv)
             print(f"  loaded {len(seeds_map)} seeds from {args.seeds_csv}")
 
-    # 3b. Auto-resolve any still-unresolved listings via Node.js GC helper
+    # 3b. Auto-resolve via the public inspect API
     if args.auto_resolve:
         unresolved_rows = [l for l in filtered
                            if l["listing_id"] not in seeds_map
                            and l["inspect_url"]]
         if unresolved_rows:
-            user = args.steam_user
-            pw   = args.steam_pass
-            if not user:
-                user = input("Steam account name: ").strip()
-            if not pw:
-                pw = getpass.getpass("Steam password: ")
-            two_fa = args.steam_2fa
-            if not two_fa:
-                maybe = input("Steam Guard mobile code (blank to skip): ").strip()
-                two_fa = maybe if maybe else None
-            try:
-                resolved = run_auto_resolver(
-                    unresolved_rows, user, pw, two_fa,
-                    request_delay_ms=args.gc_delay_ms,
-                )
-            except RuntimeError as e:
-                print(f"  auto-resolve failed: {e}", file=sys.stderr)
-                resolved = {}
-            seeds_map.update(resolved)
-            print(f"  auto-resolved {len(resolved)}/{len(unresolved_rows)} seeds")
+            api_seeds = auto_resolve(unresolved_rows, delay_sec=args.api_delay)
+            seeds_map.update(api_seeds)
+
+    # 3c. Interactive fallback for anything still unresolved
+    if args.interactive:
+        unresolved_rows = [l for l in filtered
+                           if l["listing_id"] not in seeds_map
+                           and l["inspect_url"]]
+        if unresolved_rows:
+            new_seeds = interactive_resolve(unresolved_rows)
+            seeds_map.update(new_seeds)
+            print(f"  interactively resolved {len(new_seeds)}/"
+                  f"{len(unresolved_rows)} listings")
 
     # 4. Compute bloodscope for resolved seeds
     rows = []
