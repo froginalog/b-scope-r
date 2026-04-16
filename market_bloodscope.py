@@ -1,73 +1,68 @@
 #!/usr/bin/env python3
 """
-Scrape TF2 warpaint listings from the Steam Community Market and report
-bloodscope coverage (FT + BS/WW) for each.
+Scan mannco.store listings for a given TF2 warpaint class/wear and report
+bloodscope coverage (FT + BS/WW) for each listing.
 
 Pipeline
 --------
-  1. Fetch up to --count listings for a TF2 market item (public, no auth).
-  2. Filter listings by wear level. Default includes FT/WW/BS (the only
-     wears with visible blood; FN/MW have paint_blood's adjust_offset=0).
-  3. Resolve each listing's paint_kit_seed:
-       * If --seeds-csv is supplied, read seeds from there (listing_id,seed).
-       * Otherwise, emit the Steam inspect URL so the user can resolve it.
-  4. For each resolved seed, compute bloodscope coverage for Field-Tested
-     and Battle-Scarred (WW is identical to BS -- see paintkit analysis in
-     the README).
-  5. Write a ranked CSV and print a summary.
-
-Seed resolution
----------------
-Steam's Market API does NOT expose paint_kit_seed in listing data. The
-seed is stored on the TF2 Game Coordinator as CSOEconItem.original_id.
-
-Rather than run our own Steam bot (Valve's Subscriber Agreement forbids
-using automation software to interact with Steam, which would put your
-account at risk), this script calls a free public third-party service
-that already maintains the inspect infrastructure:
-
-    GET https://inspecttf2.accurateskins.com/?url=<inspect_url>
-      -> { "success": true, "item": { "econitem": { "original_id": "...", ... } } }
-
-This is the backend used by the "Steam on Steroids / Accurate Skins"
-Chrome extension. No auth needed; they run the Steam client themselves
-and just expose an HTTP read-only endpoint. Responses take a few
-seconds (GC round-trip) so the script caches them to disk.
-
-Fallbacks if the API is unavailable:
-
-  --seeds-csv FILE    Pre-resolved listing_id,seed pairs from any source
-                      (your own inspection, saved runs, etc.)
-  --interactive       Open each inspect URL through your local Steam
-                      client yourself and paste the seed in.
+  1. Query mannco.store's /items/get for all warpaint products matching
+     --class and --wears (e.g. Sniper + Field-Tested). Mannco ships this
+     JSON endpoint unauthenticated; it returns products (aggregates of
+     listings) with id, slug, price, inventory count, name.
+  2. For each matching product, POST /requests/itemPage.php?mode=getItemList
+     to fetch individual per-listing rows. Each row's "Inspect" button
+     contains the full Steam inspect URL (S<seller>A<asset>D<dispatch>) --
+     no Steam inventory lookup needed.
+  3. For each listing, GET https://inspecttf2.accurateskins.com/?url=<inspect>
+     which runs a legit TF2 GC inspect on their side and returns the item's
+     CSOEconItem including original_id (= paint_kit_seed).
+  4. Feed each seed into paint_blood_circle_coverage.measure_coverage for
+     Field-Tested (paint_blood.png) and Battle-Scarred (paint_blood_buckets).
+  5. Write a ranked CSV with clickable mannco product URLs.
 
 Usage
 -----
-  python market_bloodscope.py "Field-Tested Harvest Sniper Rifle"
-  python market_bloodscope.py "Harvest Sniper Rifle" --count 100 --auto-resolve
-  python market_bloodscope.py "Harvest Sniper Rifle" --seeds-csv my_seeds.csv
+  python market_bloodscope.py --wears 3,4,5 --count 100
+  python market_bloodscope.py --wears 3 --max-price 1.00 --auto-resolve
+  python market_bloodscope.py --warpaint "Kiln and Conquer" --wears 3
+
+Cloudflare
+----------
+mannco.store is Cloudflare-protected, so we use curl_cffi (chrome TLS
+fingerprint impersonation) to get past the bot challenge. A normal
+`requests.get` returns 403 "Just a moment..." from their edge.
 """
 
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 import time
 import urllib.parse
-import webbrowser
 from pathlib import Path
 
-import requests
+try:
+    from curl_cffi import requests as http
+except ImportError:
+    print("ERROR: curl_cffi required for mannco.store Cloudflare bypass.",
+          file=sys.stderr)
+    print("       pip install curl_cffi", file=sys.stderr)
+    sys.exit(2)
 
-# Reuse the verified Python bloodscope pipeline
+# Reuse existing bloodscope pipeline
 REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR))
 from paint_blood_circle_coverage import measure_coverage  # noqa: E402
 
 
-# -- Wear mapping --------------------------------------------------------------
+# -- Config --------------------------------------------------------------------
+MANNCO_BASE      = "https://mannco.store"
+MANNCO_SEARCH    = f"{MANNCO_BASE}/items/get"
+MANNCO_LIST      = f"{MANNCO_BASE}/requests/itemPage.php?mode=getItemList"
+INSPECT_API      = "https://inspecttf2.accurateskins.com/"
+SEED_CACHE_PATH  = REPO_DIR / ".seed_cache.json"
+
 WEAR_NAMES = {
     1: "Factory New",
     2: "Minimal Wear",
@@ -75,209 +70,113 @@ WEAR_NAMES = {
     4: "Well-Worn",
     5: "Battle Scarred",
 }
-# TF2 warpaint market_hash_names end with "(Wear)" -- e.g.
-#   "Bamboo Brushed Sniper Rifle (Field-Tested)"
-# A few other items use the bare wear as a prefix; we match both forms.
-WEAR_MATCH = [
-    (1, ("Factory New",)),
-    (2, ("Minimal Wear",)),
-    (3, ("Field-Tested", "Field Tested")),
-    (4, ("Well-Worn", "Well Worn")),
-    (5, ("Battle Scarred", "Battle-Scarred", "Battle Scared")),
-]
+
+# Classes that have paint_blood warpaints (really any TF2 class; Sniper is default)
+CLASS_NAMES = {
+    "scout", "Soldier", "Pyro", "Demoman", "Heavy", "Engineer",
+    "Medic", "Sniper", "Spy",
+}
 
 
-def detect_wear(name: str) -> int | None:
-    for wnum, candidates in WEAR_MATCH:
-        for c in candidates:
-            if f"({c})" in name or name.startswith(f"{c} ") or name.endswith(f" {c}"):
-                return wnum
-    return None
+# -- mannco.store scraping ----------------------------------------------------
+def _make_session():
+    s = http.Session(impersonate="chrome")
+    # Warm the session with a hit to /tf2 so Cloudflare sets its __cf_bm cookie.
+    s.get(f"{MANNCO_BASE}/tf2", timeout=30)
+    return s
 
 
-def with_wear(base: str, wear: int) -> str:
-    """Produce market_hash_name for a warpaint at a given wear."""
-    return f"{base} ({WEAR_NAMES[wear]})"
+def search_products(session, tf2_class: str, wear_name: str,
+                    max_pages: int = 6, max_price_cents: int | None = None
+                    ) -> list[dict]:
+    """Return all mannco TF2 products matching a class + wear.
 
-
-# -- Steam Community Market scraper -------------------------------------------
-STEAM_MARKET_BASE = "https://steamcommunity.com/market/listings/440"
-TF2_APPID    = "440"
-TF2_CONTEXT  = "2"
-
-
-def _extract_js_object(html: str, var_name: str) -> dict | None:
-    """Pull a `var X = {...};` JS object out of the market listing HTML.
-
-    Parses the object greedily by brace balancing from the first `{` after
-    the variable name. Returns a dict or None.
+    Walks pages sorted price-ASC until we've seen all matching warpaint
+    products. mannco returns 50 per page; `max_pages=6` = up to 300
+    products per query, well past the typical warpaint inventory size.
     """
-    m = re.search(rf"\b{re.escape(var_name)}\s*=\s*", html)
-    if not m:
-        return None
-    i = m.end()
-    if i >= len(html) or html[i] != "{":
-        return None
-    # Brace-balanced extraction (skip string literals).
-    depth      = 0
-    in_str     = False
-    str_ch     = ""
-    esc        = False
-    start      = i
-    while i < len(html):
-        ch = html[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == str_ch:
-                in_str = False
-        else:
-            if ch in '"\'':
-                in_str = True
-                str_ch = ch
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(html[start:i + 1])
-                    except json.JSONDecodeError:
-                        return None
-        i += 1
-    return None
+    wanted_tag = f"({wear_name})"
+    all_products: list[dict] = []
+    seen: set[int] = set()
+    for page in range(1, max_pages + 1):
+        params = {
+            "game":  440,
+            "class": tf2_class,
+            "wear":  wear_name,
+            "page":  page,
+            "skip":  (page - 1) * 50,
+            "price": "ASC",
+            "q":     "-",
+        }
+        resp = session.get(MANNCO_SEARCH, params=params, timeout=30)
+        resp.raise_for_status()
+        items = resp.json()
+        if not items:
+            break
+        for it in items:
+            if it["id"] in seen:
+                continue
+            name = it.get("name", "")
+            # Keep only actual warpaint sniper rifles at the right wear
+            if wanted_tag not in name:
+                continue
+            if "Sniper Rifle" not in name and "Rifle" not in name:
+                continue
+            price_c = int(it.get("price") or 0)
+            if max_price_cents is not None and price_c > max_price_cents:
+                continue
+            it["_wear"] = wear_name
+            seen.add(it["id"])
+            all_products.append(it)
+        if len(items) < 50:
+            break
+        time.sleep(0.5)
+    return all_products
 
 
-def fetch_listings_page(item_name: str, start: int = 0, count: int = 100) -> dict:
-    """GET the TF2 market listing HTML and extract its JS data objects.
+# Regex used to parse individual listing rows returned by itemPage.php.
+# Each row has: itemid, itemprice, inspect URL with S<seller>A<asset>D<dispatch>.
+_LISTING_RE = re.compile(
+    r'itemid="(?P<mannco_id>\d+)"[^<]*?itemprice="(?P<price>\d+)"'
+    r'(?:.|\n)*?steam://rungame/440/[^"\']*?'
+    r'\+tf_econ_item_preview%20S(?P<seller>\d+)A(?P<asset>\d+)D(?P<dispatch>\d+)',
+)
 
-    Returns a dict with `listinginfo` and `assets` keyed the same way the
-    JSON `/render/` endpoint used to, so the rest of the code can stay
-    agnostic to the source. `start`/`count` are currently ignored because
-    Steam's HTML page returns the default page; we call it once per item
-    and take the (usually) ~10-100 listings it ships embedded.
-    """
-    url = f"{STEAM_MARKET_BASE}/{urllib.parse.quote(item_name)}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (bloodscope-market-scraper; "
-            "https://github.com/froginalog/b-scope-r)"
-        ),
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    resp = requests.get(url, headers=headers, timeout=30)
-    if resp.status_code == 429:
-        raise RuntimeError("Steam Market rate-limited (HTTP 429). Wait ~5 min.")
-    resp.raise_for_status()
 
+def fetch_product_listings(session, product_id: int, product_url: str,
+                           product_name: str) -> list[dict]:
+    """POST to mannco's per-item listings endpoint and parse each row."""
+    referer = f"{MANNCO_BASE}/item/{product_url}"
+    resp = session.post(
+        MANNCO_LIST,
+        data={"page": 1, "nbPerPage": 50, "id": product_id},
+        headers={"Referer": referer, "X-Requested-With": "XMLHttpRequest"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        return []
     html = resp.text
-    listinginfo = _extract_js_object(html, "g_rgListingInfo") or {}
-    assets      = _extract_js_object(html, "g_rgAssets")      or {}
-    return {"listinginfo": listinginfo, "assets": assets}
-
-
-def fetch_all_listings(item_name: str, total: int) -> list[dict]:
-    """One request = one market page's worth of embedded listings.
-
-    Steam pages typically show up to 10 listings per page in the HTML. For
-    bigger pulls we'd need to drive `?start=N` on the HTML page too, but
-    most warpaints have fewer than that anyway. Kept simple for now.
-
-    The wear is taken from the item_name (the market page URL), NOT from
-    the asset's JSON -- the asset name doesn't include the wear suffix.
-    """
-    raw       = fetch_listings_page(item_name)
-    wear_num  = detect_wear(item_name)
-    listings  = parse_listings(raw)
-    for l in listings:
-        # Stamp the wear from the query context, since the asset doesn't
-        # carry it by itself.
-        if wear_num is not None:
-            l["wear"]      = wear_num
-            l["wear_name"] = WEAR_NAMES[wear_num]
-            # Make the displayed name include the wear so downstream tools
-            # don't have to reconstruct it.
-            if WEAR_NAMES[wear_num] not in l["name"]:
-                l["name"] = f"{l['name']} ({WEAR_NAMES[wear_num]})"
-    return listings[:total]
-
-
-def parse_listings(raw: dict) -> list[dict]:
-    """Pull (listing_id, asset_id, wear, price, inspect URL) per listing."""
     listings = []
-    listinginfo = raw.get("listinginfo") or {}
-    assets_root = raw.get("assets") or {}
-    # When the market page has no listings, Steam ships `g_rgAssets = [];`
-    if not isinstance(assets_root, dict):
-        return listings
-    assets_by_id = assets_root.get(TF2_APPID, {})
-    if not isinstance(assets_by_id, dict):
-        return listings
-    assets_by_id = assets_by_id.get(TF2_CONTEXT, {})
-    if not isinstance(assets_by_id, dict):
-        assets_by_id = {}
-
-    if not isinstance(listinginfo, dict):
-        return listings
-
-    for listing_id, info in listinginfo.items():
-        asset    = (info.get("asset") or {}) if isinstance(info, dict) else {}
-        asset_id = str(asset.get("id") or "")
-        adata    = (assets_by_id.get(asset_id) or {}) if isinstance(assets_by_id, dict) else {}
-        name     = adata.get("name") or adata.get("market_hash_name") or ""
-
-        wear_num = detect_wear(name)
-
-        inspect_url = ""
-        for action in adata.get("actions") or []:
-            link = (action or {}).get("link") or ""
-            if "+tf_econ_item_preview" in link or "+csgo_econ_action_preview" in link:
-                inspect_url = (link
-                    .replace("%listingid%", str(listing_id))
-                    .replace("%assetid%",   asset_id))
-                break
-
-        price_cents = ((info.get("converted_price") or 0) +
-                       (info.get("converted_fee")   or 0))
-
+    for m in _LISTING_RE.finditer(html):
+        inspect = (
+            f"steam://rungame/440/76561202255233023/+tf_econ_item_preview "
+            f"S{m['seller']}A{m['asset']}D{m['dispatch']}"
+        )
         listings.append({
-            "listing_id":  str(listing_id),
-            "asset_id":    asset_id,
-            "name":        name,
-            "wear":        wear_num,
-            "wear_name":   WEAR_NAMES.get(wear_num, "?"),
-            "price_cents": price_cents,
-            "inspect_url": inspect_url,
+            "mannco_id":       m["mannco_id"],
+            "product_id":      product_id,
+            "product_url":     product_url,
+            "product_name":    product_name,
+            "price_cents":     int(m["price"]),
+            "seller_steamid":  m["seller"],
+            "asset_id":        m["asset"],
+            "inspect_url":     inspect,
+            "mannco_page_url": f"{MANNCO_BASE}/item/{product_url}",
         })
     return listings
 
 
-# -- Seeds CSV loader ---------------------------------------------------------
-def load_seeds_csv(path: Path) -> dict[str, int]:
-    """listing_id -> seed mapping. Accepts either 'listing_id' or 'listingid'."""
-    out: dict[str, int] = {}
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            lid  = str(row.get("listing_id") or row.get("listingid") or "").strip()
-            seed = str(row.get("seed") or "").strip()
-            if lid and seed:
-                try:
-                    out[lid] = int(seed)
-                except ValueError:
-                    pass
-    return out
-
-
-# -- Third-party API resolver -------------------------------------------------
-INSPECT_API       = "https://inspecttf2.accurateskins.com/"
-SEED_CACHE_PATH   = REPO_DIR / ".seed_cache.json"
-API_RETRY         = 2
-API_TIMEOUT_SEC   = 30
-API_DEFAULT_DELAY = 1.0     # polite spacing between requests (seconds)
-
-
+# -- Seed resolution ----------------------------------------------------------
 def _load_seed_cache() -> dict:
     if SEED_CACHE_PATH.exists():
         try:
@@ -292,322 +191,187 @@ def _save_seed_cache(cache: dict) -> None:
         json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _api_resolve_seed(inspect_url: str, session: requests.Session) -> dict | None:
-    """Call inspecttf2.accurateskins.com and return the parsed item dict, or None."""
-    params = {"url": inspect_url}
-    last_err = None
-    for attempt in range(API_RETRY):
+def resolve_seed(inspect_url: str, session) -> int | None:
+    """GET inspecttf2.accurateskins.com and pull original_id = paint_kit_seed."""
+    for attempt in range(3):
         try:
-            resp = session.get(INSPECT_API, params=params, timeout=API_TIMEOUT_SEC)
-            if resp.status_code == 429:
-                # Rate limited; back off
+            r = session.get(INSPECT_API, params={"url": inspect_url},
+                            timeout=30, impersonate="chrome")
+            if r.status_code == 429:
                 time.sleep(5 * (attempt + 1))
                 continue
-            resp.raise_for_status()
-            body = resp.json()
+            if r.status_code != 200:
+                return None
+            body = r.json()
             if not body.get("success"):
                 return None
-            return body.get("item", {}).get("econitem")
-        except requests.RequestException as e:
-            last_err = e
+            oid = body.get("item", {}).get("econitem", {}).get("original_id")
+            if oid is None:
+                return None
+            return int(oid)
+        except Exception:
             time.sleep(2 * (attempt + 1))
-    if last_err:
-        print(f"    API error: {last_err}", file=sys.stderr)
     return None
-
-
-def auto_resolve(unresolved_rows: list[dict],
-                 delay_sec: float = API_DEFAULT_DELAY) -> dict[str, int]:
-    """Resolve seeds for each unresolved listing via the public inspect API.
-
-    The seed used for bloodscope is CSOEconItem.original_id -- this is what
-    the TF2 compositor itself uses (c_tf_player.cpp:3893:
-        uint64 seed = pItem->GetOriginalID();
-    ). The attribute 866/867 "custom paintkit seed" value is also on the
-    response, but original_id is the one that drives the UV transform.
-
-    Responses are cached to {REPO}/.seed_cache.json keyed by listing_id so
-    repeated runs never re-hit the API for the same listing.
-    """
-    cache   = _load_seed_cache()
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "bloodscope-market (https://github.com/froginalog/b-scope-r)"
-        ),
-        "Accept": "application/json",
-    })
-    resolved: dict[str, int] = {}
-    n = len(unresolved_rows)
-    print(f"\n=== Auto-resolving {n} listings via inspecttf2.accurateskins.com ===")
-    print(f"    (cache: {SEED_CACHE_PATH})")
-    t0 = time.time()
-    for i, row in enumerate(unresolved_rows, 1):
-        lid = row["listing_id"]
-        url = row["inspect_url"]
-        if not url:
-            print(f"  [{i}/{n}] {lid}  (no inspect URL)")
-            continue
-        # Cache hit?
-        if lid in cache and cache[lid].get("seed"):
-            seed = int(cache[lid]["seed"])
-            resolved[lid] = seed
-            print(f"  [{i}/{n}] {lid}  (cached)  seed={seed}")
-            continue
-        t = time.time()
-        item = _api_resolve_seed(url, session)
-        ms = int((time.time() - t) * 1000)
-        if not item:
-            print(f"  [{i}/{n}] {lid}  ({ms} ms)  API returned no item")
-            continue
-        try:
-            seed = int(item.get("original_id", 0))
-        except (TypeError, ValueError):
-            seed = 0
-        if not seed:
-            print(f"  [{i}/{n}] {lid}  ({ms} ms)  no original_id in response")
-            continue
-        resolved[lid] = seed
-        cache[lid] = {"seed": seed, "resolved_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-        print(f"  [{i}/{n}] {lid}  ({ms} ms)  seed={seed}")
-        # Persist cache periodically so a crash doesn't lose progress
-        if i % 10 == 0:
-            _save_seed_cache(cache)
-        if i < n:
-            time.sleep(delay_sec)
-    _save_seed_cache(cache)
-    elapsed = time.time() - t0
-    print(f"  resolved {len(resolved)}/{n} in {elapsed:.1f} s\n")
-    return resolved
-
-
-# -- Interactive manual resolution --------------------------------------------
-def _open_inspect_url(url: str) -> None:
-    """Hand the inspect URL to the OS so Steam + TF2 open the inspect panel.
-
-    This is exactly what happens when you click "Inspect in Game" on the
-    Steam Market web page -- the browser hands the `steam://` URL to the
-    Steam protocol handler, which launches TF2 and runs the inspect
-    command. No automation, no third-party client, no ToS concern.
-    """
-    # webbrowser.open handles steam:// URLs on all three major OSes
-    # (Windows hands them to the Steam protocol handler, macOS too, Linux
-    # via xdg-open which routes through the registered scheme).
-    webbrowser.open(url)
-
-
-def interactive_resolve(unresolved_rows: list[dict]) -> dict[str, int]:
-    """Walk the user through unresolved listings one at a time.
-
-    For each listing: opens the inspect URL through the user's real Steam
-    client, prompts them to read the pattern number from the TF2 inspect
-    panel and paste it in. Empty input skips the listing; 'q' quits the
-    loop and keeps whatever was resolved so far.
-    """
-    out: dict[str, int] = {}
-    n = len(unresolved_rows)
-    print()
-    print(f"=== Interactive seed resolution ({n} listings) ===")
-    print("Each URL will be handed to Steam, which will open the item in TF2.")
-    print("Read the pattern number shown in TF2's inspect panel and paste it.")
-    print("  [Enter] skip this one    [q] quit and keep what we have so far")
-    print()
-    for i, row in enumerate(unresolved_rows, 1):
-        lid  = row["listing_id"]
-        wear = row["wear_name"]
-        url  = row["inspect_url"]
-        price = row["price_cents"] / 100.0
-        print(f"[{i}/{n}] listing {lid}  {wear}  ${price:.2f}")
-        if not url:
-            print("  (no inspect URL on this listing, skipping)")
-            continue
-        print(f"  opening: {url}")
-        try:
-            _open_inspect_url(url)
-        except Exception as e:
-            print(f"  could not open URL automatically: {e}")
-        try:
-            raw = input("  seed (integer) > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  aborted by user")
-            break
-        if raw.lower() in ("q", "quit", "exit"):
-            print("  quit; keeping what we have so far")
-            break
-        if not raw:
-            continue
-        try:
-            out[lid] = int(raw)
-        except ValueError:
-            print(f"  '{raw}' is not an integer; skipping")
-    print()
-    return out
 
 
 # -- CLI ----------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p.add_argument(
-        "item",
-        help='Market item name, e.g. "Field-Tested Harvest Sniper Rifle". '
-             "Case-sensitive, matches Steam's market_hash_name exactly.",
-    )
-    p.add_argument("--count", type=int, default=100,
-                   help="Number of listings to pull (default 100).")
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--class", dest="tf2_class", default="Sniper",
+                   help=f"TF2 class. One of: {sorted(CLASS_NAMES)}. Default Sniper.")
     p.add_argument("--wears", default="3,4,5",
-                   help="Comma-separated wear levels to keep. "
-                        "1=FN 2=MW 3=FT 4=WW 5=BS. Default 3,4,5.")
-    p.add_argument("--seeds-csv", type=Path,
-                   help="CSV with listing_id,seed rows of pre-resolved seeds.")
-    p.add_argument("--out", type=Path, default=Path("market_bloodscopes.csv"),
-                   help="Output CSV path (default market_bloodscopes.csv).")
-    p.add_argument("--threshold", type=float, default=0.20,
-                   help="Darkness threshold for 'bloody' pixel (default 0.20).")
+                   help="Comma-separated wears (1=FN 2=MW 3=FT 4=WW 5=BS). "
+                        "Default 3,4,5 (the visible-blood wears).")
+    p.add_argument("--count", type=int, default=100,
+                   help="Max number of listings to check (default 100).")
+    p.add_argument("--warpaint", default=None,
+                   help="Optional warpaint name substring filter (e.g. 'Harvest').")
+    p.add_argument("--max-price", type=float, default=None,
+                   help="Skip products priced above $USD.")
+    p.add_argument("--max-pages", type=int, default=6,
+                   help="Max mannco catalog pages per wear (default 6 = 300 products).")
     p.add_argument("--auto-resolve", action="store_true",
-                   help="Resolve seeds via the public inspecttf2.accurateskins.com "
-                        "inspect API (no Steam login, no bot). Results are "
-                        f"cached to {SEED_CACHE_PATH.name} for subsequent runs.")
-    p.add_argument("--api-delay", type=float, default=API_DEFAULT_DELAY,
-                   help="Seconds between API calls (default 1.0).")
-    p.add_argument("--interactive", action="store_true",
-                   help="Fallback: open each unresolved inspect URL through "
-                        "your Steam client and prompt you to paste the pattern "
-                        "number. Zero automation. Used AFTER --auto-resolve if both "
-                        "are passed.")
+                   help="Resolve seeds via inspecttf2.accurateskins.com and compute bloodscope.")
+    p.add_argument("--api-delay", type=float, default=1.0,
+                   help="Seconds between inspect-API calls (default 1.0).")
+    p.add_argument("--threshold", type=float, default=0.20,
+                   help="Darkness threshold for 'bloody' pixel.")
+    p.add_argument("--out", type=Path, default=Path("market_bloodscopes.csv"))
     args = p.parse_args()
 
-    wears = {int(w) for w in args.wears.split(",") if w.strip()}
-
-    # 1. Scrape
-    # TF2 warpaints are listed per-wear on the market, so if the item name
-    # doesn't already include a wear prefix, fetch each wear separately.
-    item_has_wear = detect_wear(args.item) is not None
-    if item_has_wear:
-        queries = [args.item]
-    else:
-        queries = [with_wear(args.item, w) for w in sorted(wears)]
-
-    listings: list[dict] = []
-    remaining = args.count
-    for q in queries:
-        if remaining <= 0:
-            break
-        per_q = remaining if item_has_wear else max(1, args.count // len(queries))
-        print(f"Fetching up to {per_q} listings for {q!r}...")
-        try:
-            page = fetch_all_listings(q, per_q)
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else "?"
-            if code == 404:
-                print(f"  not found (404): {q}")
-                continue
-            print(f"  HTTP error: {e}", file=sys.stderr)
-            sys.exit(1)
-        print(f"  got {len(page)} listings")
-        listings.extend(page)
-        remaining = args.count - len(listings)
-        # Small pause between wear queries to stay polite
-        if q != queries[-1]:
-            time.sleep(1.0)
-
-    if not listings:
-        print("No listings returned. Verify the item name on Steam Market.",
+    if args.tf2_class not in CLASS_NAMES:
+        print(f"unknown --class {args.tf2_class!r}; choose from {sorted(CLASS_NAMES)}",
               file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
-    # 2. Filter by wear
-    filtered = [l for l in listings if l["wear"] in wears]
-    wear_label = ", ".join(WEAR_NAMES[w] for w in sorted(wears))
-    print(f"\n{len(filtered)}/{len(listings)} match wears {sorted(wears)} ({wear_label})")
+    wear_nums = [int(w) for w in args.wears.split(",") if w.strip()]
+    for w in wear_nums:
+        if w not in WEAR_NAMES:
+            print(f"unknown wear number {w}", file=sys.stderr)
+            sys.exit(2)
 
-    # 3. Resolve seeds from CSV if provided
-    seeds_map: dict[str, int] = {}
-    if args.seeds_csv:
-        if not args.seeds_csv.exists():
-            print(f"  warning: --seeds-csv {args.seeds_csv} not found; "
-                  f"treating all listings as unresolved")
-        else:
-            seeds_map = load_seeds_csv(args.seeds_csv)
-            print(f"  loaded {len(seeds_map)} seeds from {args.seeds_csv}")
-
-    # 3b. Auto-resolve via the public inspect API
-    if args.auto_resolve:
-        unresolved_rows = [l for l in filtered
-                           if l["listing_id"] not in seeds_map
-                           and l["inspect_url"]]
-        if unresolved_rows:
-            api_seeds = auto_resolve(unresolved_rows, delay_sec=args.api_delay)
-            seeds_map.update(api_seeds)
-
-    # 3c. Interactive fallback for anything still unresolved
-    if args.interactive:
-        unresolved_rows = [l for l in filtered
-                           if l["listing_id"] not in seeds_map
-                           and l["inspect_url"]]
-        if unresolved_rows:
-            new_seeds = interactive_resolve(unresolved_rows)
-            seeds_map.update(new_seeds)
-            print(f"  interactively resolved {len(new_seeds)}/"
-                  f"{len(unresolved_rows)} listings")
-
-    # 4. Compute bloodscope for resolved seeds
-    rows = []
-    for i, l in enumerate(filtered, 1):
-        seed   = seeds_map.get(l["listing_id"])
-        ft_pct = bs_pct = None
-        if seed is not None:
-            print(f"    [{i}/{len(filtered)}] listing {l['listing_id']}  seed {seed} ...",
-                  end="", flush=True)
-            try:
-                ft = measure_coverage(seed, 3, threshold=args.threshold)
-                bs = measure_coverage(seed, 5, threshold=args.threshold)
-                ft_pct = round(ft["coverage_pct"], 2)
-                bs_pct = round(bs["coverage_pct"], 2)
-                print(f"  FT={ft_pct}%  BS={bs_pct}%")
-            except Exception as ex:
-                print(f"  failed: {ex}")
-        rows.append({**l, "seed": seed, "ft_pct": ft_pct, "bs_pct": bs_pct})
-
-    # 5. Write CSV
-    fieldnames = ["listing_id", "asset_id", "name", "wear", "wear_name",
-                  "price_cents", "seed", "ft_pct", "bs_pct", "inspect_url"]
-    with open(args.out, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-    print(f"\nWrote {args.out} ({len(rows)} rows)")
-
-    # 6. Human-readable summary
-    resolved   = [r for r in rows if r["seed"] is not None]
-    unresolved = [r for r in rows if r["seed"] is None]
-
-    if resolved:
-        resolved.sort(
-            key=lambda r: max(r["ft_pct"] or 0, r["bs_pct"] or 0),
-            reverse=True,
+    print(f"[1/4] mannco.store: searching {args.tf2_class} warpaints, "
+          f"wears={[WEAR_NAMES[w] for w in wear_nums]}...")
+    session = _make_session()
+    max_price_c = int(args.max_price * 100) if args.max_price else None
+    products: list[dict] = []
+    for wnum in wear_nums:
+        ps = search_products(
+            session, args.tf2_class, WEAR_NAMES[wnum],
+            max_pages=args.max_pages, max_price_cents=max_price_c,
         )
-        print(f"\n=== Top bloodscopes ({len(resolved)} resolved) ===")
-        print(f"  {'wear':15s}  {'FT%':>6s}  {'BS%':>6s}  "
-              f"{'seed':>15s}  {'price':>8s}  listing_id")
-        for r in resolved[:25]:
-            print(f"  {r['wear_name']:15s}  {r['ft_pct']:6.2f}  {r['bs_pct']:6.2f}  "
-                  f"{r['seed']:>15d}  ${r['price_cents']/100:6.2f}  {r['listing_id']}")
+        if args.warpaint:
+            needle = args.warpaint.lower()
+            ps = [p for p in ps if needle in p["name"].lower()]
+        print(f"      {WEAR_NAMES[wnum]:16s}  {len(ps):>4d} product(s), "
+              f"total inventory: {sum(int(p['nbb']) for p in ps)} listings")
+        products.extend(ps)
 
-    if unresolved:
-        print(f"\n=== {len(unresolved)} listings need seed resolution ===")
-        print("Steam Market does not expose paint_kit_seed; see module docstring.")
-        print("Inspect URLs for the first 5 unresolved listings:")
-        for r in unresolved[:5]:
-            print(f"  listing {r['listing_id']}  {r['wear_name']:15s}  "
-                  f"${r['price_cents']/100:6.2f}")
-            if r["inspect_url"]:
-                print(f"    {r['inspect_url']}")
-        print("\nTo resolve: inspect each via TF2 or a Steam GC bot, save the")
-        print("(listing_id, seed) pairs to a CSV, then rerun with --seeds-csv.")
+    if not products:
+        print("      no warpaint products found for these filters.")
+        sys.exit(0)
+
+    print(f"[2/4] fetching individual listings per product "
+          f"(up to {args.count} total)...")
+    listings: list[dict] = []
+    for i, prod in enumerate(products, 1):
+        if len(listings) >= args.count:
+            break
+        rows = fetch_product_listings(
+            session, prod["id"], prod["url"], prod["name"])
+        # Stamp wear_num for each row
+        wear_num = None
+        for num, name in WEAR_NAMES.items():
+            if f"({name})" in prod["name"]:
+                wear_num = num
+                break
+        for r_ in rows:
+            r_["wear_num"]  = wear_num
+            r_["wear_name"] = WEAR_NAMES.get(wear_num, "?")
+            listings.append(r_)
+            if len(listings) >= args.count:
+                break
+        if i % 10 == 0 or i == len(products):
+            print(f"      progress: scanned {i}/{len(products)} products, "
+                  f"{len(listings)} listings so far")
+        time.sleep(0.3)
+
+    listings = listings[:args.count]
+    print(f"      collected {len(listings)} listings")
+
+    # Seed resolution + bloodscope
+    if args.auto_resolve and listings:
+        print(f"[3/4] resolving {len(listings)} seeds via "
+              f"inspecttf2.accurateskins.com (~{args.api_delay}s apart)...")
+        cache = _load_seed_cache()
+        t0 = time.time()
+        for i, l in enumerate(listings, 1):
+            key = l["inspect_url"]
+            cached = cache.get(key, {}).get("seed")
+            if cached:
+                l["seed"] = int(cached)
+                print(f"      [{i:>3}/{len(listings)}] {l['mannco_id']:>10}  "
+                      f"(cached)  seed={l['seed']}")
+            else:
+                t = time.time()
+                seed = resolve_seed(key, session)
+                ms = int((time.time() - t) * 1000)
+                if seed is None:
+                    l["seed"] = None
+                    print(f"      [{i:>3}/{len(listings)}] {l['mannco_id']:>10}  "
+                          f"({ms} ms) FAILED")
+                else:
+                    l["seed"] = seed
+                    cache[key] = {"seed": seed}
+                    print(f"      [{i:>3}/{len(listings)}] {l['mannco_id']:>10}  "
+                          f"({ms} ms) seed={seed}")
+                if i % 10 == 0:
+                    _save_seed_cache(cache)
+                time.sleep(args.api_delay)
+        _save_seed_cache(cache)
+        print(f"      resolved in {time.time() - t0:.1f}s")
+
+        print("[4/4] computing bloodscope coverage...")
+        for i, l in enumerate(listings, 1):
+            if not l.get("seed"):
+                continue
+            try:
+                ft = measure_coverage(l["seed"], 3, threshold=args.threshold)
+                bs = measure_coverage(l["seed"], 5, threshold=args.threshold)
+                l["ft_pct"] = round(ft["coverage_pct"], 2)
+                l["bs_pct"] = round(bs["coverage_pct"], 2)
+            except Exception as e:
+                print(f"      seed {l['seed']} bloodscope error: {e}")
+                l["ft_pct"] = None
+                l["bs_pct"] = None
+
+    # Output CSV
+    columns = ["mannco_id", "product_name", "wear_name", "price_cents",
+               "seed", "ft_pct", "bs_pct", "mannco_page_url",
+               "inspect_url", "seller_steamid", "asset_id"]
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
+        w.writeheader()
+        for l in listings:
+            w.writerow({c: l.get(c, "") for c in columns})
+    print(f"\nwrote {args.out} ({len(listings)} rows)")
+
+    # Summary
+    if args.auto_resolve:
+        resolved = [l for l in listings if l.get("seed") is not None
+                    and l.get("ft_pct") is not None]
+        if resolved:
+            resolved.sort(key=lambda r: max(r["ft_pct"], r["bs_pct"]),
+                          reverse=True)
+            print(f"\n=== Top bloodscopes ({len(resolved)} resolved) ===")
+            print(f"  {'wear':16s}  {'FT%':>6s}  {'BS%':>6s}  "
+                  f"{'price':>8s}  {'seed':>12s}  mannco page")
+            for l in resolved[:25]:
+                ft, bs = l["ft_pct"], l["bs_pct"]
+                print(f"  {l['wear_name']:16s}  {ft:6.2f}  {bs:6.2f}  "
+                      f"${l['price_cents']/100:6.2f}  {l['seed']:>12d}  "
+                      f"{l['mannco_page_url']}")
 
 
 if __name__ == "__main__":
