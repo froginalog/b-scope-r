@@ -103,6 +103,101 @@ fn make_pb(total: u64, tag: &str) -> ProgressBar {
 }
 
 
+// -- Per-config GPU enumeration ---------------------------------------------
+fn run_gpu_for_config(
+    cfg: PaintkitConfig,
+    pat_blood: &[u8],
+    pat_buckets: &[u8],
+    offsets: &[(f32, f32)],
+    args: &Args,
+    wants_ft: bool,
+    wants_buckets: bool,
+) -> std::io::Result<()> {
+    eprintln!("=== {} ===", cfg.label);
+    eprintln!("  scale_uv  = ({}, {})", cfg.scale_min, cfg.scale_max);
+    eprintln!("  bs texture = {}",
+        if cfg.bs_buckets { "paint_blood_buckets" } else { "paint_blood" });
+
+    // Build combined bitmap: bit0 = FT (always paint_blood),
+    // bit1 = BS (paint_blood_buckets for Group A, paint_blood for Group B).
+    let pf = pat_blood;
+    let pb = if cfg.bs_buckets { pat_buckets } else { pat_blood };
+    let mut combined = vec![0u8; pf.len()];
+    for i in 0..pf.len() {
+        combined[i] = (pf[i] & 1) | ((pb[i] & 1) << 1);
+    }
+
+    // Per-config output paths (suffix lets two configs coexist).
+    let csv_path = args.out.join(format!("bloodscopes{}.csv", cfg.csv_suffix));
+    let mut csv_writer = if args.min_pct <= 100 {
+        let mut w = BufWriter::with_capacity(1 << 20, File::create(&csv_path)?);
+        writeln!(w, "seed,field_tested_pct,well_worn_battle_scarred_pct")?;
+        Some(w)
+    } else { None };
+    let mut ft_writer = if wants_ft && args.full_binary {
+        Some(BufWriter::with_capacity(1 << 20, File::create(args.out.join(
+            format!("bloodscope_field_tested{}.u8", cfg.csv_suffix)))?))
+    } else { None };
+    let mut bk_writer = if wants_buckets && args.full_binary {
+        Some(BufWriter::with_capacity(1 << 20, File::create(args.out.join(
+            format!("bloodscope_buckets{}.u8", cfg.csv_suffix)))?))
+    } else { None };
+
+    eprintln!("Initializing GPU...");
+    let runner = pollster::block_on(gpu::GpuRunner::new(
+        offsets, &combined, args.gpu_batch))
+        .unwrap_or_else(|e| {
+            eprintln!("GPU init failed: {e}");
+            std::process::exit(3);
+        });
+
+    let total = args.end - args.start;
+    let t0 = Instant::now();
+    let pb_progress = make_pb(total, "GPU");
+
+    let mut cur = args.start;
+    while cur < args.end {
+        let remaining = (args.end - cur).min(args.gpu_batch as u64);
+        let n = remaining as u32;
+        let packed = runner.run_batch(cur, n, (cfg.scale_min, cfg.scale_max));
+
+        let mut ft_buf = if wants_ft      { Vec::with_capacity(n as usize) } else { Vec::new() };
+        let mut bk_buf = if wants_buckets { Vec::with_capacity(n as usize) } else { Vec::new() };
+        for &w in &packed {
+            if wants_ft      { ft_buf.push( (w & 0xFF) as u8); }
+            if wants_buckets { bk_buf.push(((w >> 8) & 0xFF) as u8); }
+        }
+
+        if let Some(w) = ft_writer.as_mut() { w.write_all(&ft_buf)?; }
+        if let Some(w) = bk_writer.as_mut() { w.write_all(&bk_buf)?; }
+        if let Some(w) = csv_writer.as_mut() {
+            let min = args.min_pct;
+            for i in 0..n as usize {
+                let fv = if wants_ft { ft_buf[i] } else { 0 };
+                let bv = if wants_buckets { bk_buf[i] } else { 0 };
+                if fv >= min || bv >= min {
+                    writeln!(w, "{},{},{}", cur + i as u64, fv, bv)?;
+                }
+            }
+        }
+
+        cur += n as u64;
+        pb_progress.inc(n as u64);
+    }
+    pb_progress.finish_with_message("done");
+
+    if let Some(w) = ft_writer.as_mut()  { w.flush()?; }
+    if let Some(w) = bk_writer.as_mut()  { w.flush()?; }
+    if let Some(w) = csv_writer.as_mut() { w.flush()?; }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    eprintln!("Done (GPU: {}). {} seeds in {:.1}s  ({:.0} seed/s)",
+        runner.adapter_name, total, elapsed, total as f64 / elapsed);
+    eprintln!("CSV: {:?}\n", csv_path);
+    Ok(())
+}
+
+
 // -- Texture + scope geometry (must match paint_blood_circle_coverage.py) ----
 const W: u32 = 2048;
 const H: u32 = 2048;
@@ -196,7 +291,10 @@ fn get_seed_lo(n: u64) -> u32 {
 
 /// (u, v, rotation, scale) for `paint_blood` stage given a paint_kit_seed.
 #[inline]
-fn compute_blood_uv(paint_kit_seed: u64) -> (f32, f32, f32, f32) {
+fn compute_blood_uv(
+    paint_kit_seed: u64,
+    scale_range: (f32, f32),
+) -> (f32, f32, f32, f32) {
     let lo = get_seed_lo(paint_kit_seed) as i32;
     let mut rng = Rng::seeded(lo);
 
@@ -207,7 +305,7 @@ fn compute_blood_uv(paint_kit_seed: u64) -> (f32, f32, f32, f32) {
     let u     = rng.random_float(0.0, 1.0);
     let v     = rng.random_float(0.0, 1.0);
     let rot   = rng.random_float(0.0, 360.0);
-    let scale = rng.random_float(0.4, 0.5);
+    let scale = rng.random_float(scale_range.0, scale_range.1);
     (u, v, rot, scale)
 }
 
@@ -251,8 +349,8 @@ fn load_pattern(path: &std::path::Path) -> Vec<u8> {
 // -- Core per-seed coverage --------------------------------------------------
 /// Compute R*S*T matrix coefficients once per seed (6 f32s).
 #[inline(always)]
-fn setup(seed: u64) -> (f32, f32, f32, f32) {
-    let (tu, tv, rot, scale) = compute_blood_uv(seed);
+fn setup(seed: u64, scale_range: (f32, f32)) -> (f32, f32, f32, f32) {
+    let (tu, tv, rot, scale) = compute_blood_uv(seed, scale_range);
     let rad = rot.to_radians();
     let (c, s) = (rad.cos(), rad.sin());
     let mc = scale * c;
@@ -272,8 +370,11 @@ const BIG: f32 = 1024.0;
 
 /// Coverage for ONE pattern (u8 per pixel, 0 or 1).
 #[inline]
-fn coverage_pct_one(seed: u64, pattern: &[u8], offsets_uv: &[(f32, f32)]) -> u8 {
-    let (mc, ms, tpx, tpy) = setup(seed);
+fn coverage_pct_one(
+    seed: u64, pattern: &[u8], offsets_uv: &[(f32, f32)],
+    scale_range: (f32, f32),
+) -> u8 {
+    let (mc, ms, tpx, tpy) = setup(seed, scale_range);
 
     let mut hit: u32 = 0;
     for &(ou, ov) in offsets_uv {
@@ -298,8 +399,9 @@ fn coverage_pct_both(
     seed: u64,
     combined: &[u8],
     offsets_uv: &[(f32, f32)],
+    scale_range: (f32, f32),
 ) -> (u8, u8) {
-    let (mc, ms, tpx, tpy) = setup(seed);
+    let (mc, ms, tpx, tpy) = setup(seed, scale_range);
 
     let mut hit_ft: u32 = 0;
     let mut hit_bk: u32 = 0;
@@ -342,9 +444,9 @@ fn self_test() -> bool {
         if rng_ok { "OK" } else { "FAIL" }
     );
 
-    // Ground truth seeds 53 and 72
+    // Ground truth seeds 53 and 72 (Harvest scale 0.4-0.5)
     let check = |seed: u64, eu: f32, ev: f32, erot: f32, escale: f32| -> bool {
-        let (u, v, rot, sc) = compute_blood_uv(seed);
+        let (u, v, rot, sc) = compute_blood_uv(seed, (0.4, 0.5));
         let ok = (u - eu).abs() < 2e-3
             && (v - ev).abs() < 2e-3
             && (rot - erot).abs() < 5e-2
@@ -358,7 +460,7 @@ fn self_test() -> bool {
     let a = check(53, 0.606, 0.670, 193.978, 0.429);
     let b = check(72, 0.662, 0.767, 21.384, 0.498);
     // seed 4466973305: user-provided; coverage should be ~100
-    let (u, v, rot, sc) = compute_blood_uv(4_466_973_305);
+    let (u, v, rot, sc) = compute_blood_uv(4_466_973_305, (0.4, 0.5));
     eprintln!(
         "seed 4466973305:  u={:.3}  v={:.3}  rot={:.3}  scale={:.3}",
         u, v, rot, sc
@@ -430,10 +532,59 @@ struct Args {
     #[arg(long, default_value_t = 1u32 << 22)]
     gpu_batch: u32,
 
+    /// Paintkit scale_uv range minimum. Per-paintkit value -- look it
+    /// up in _paintkits_master.txt. For sniper rifles:
+    ///     harvest_/gentlemanne_/pyroland_/warbird_: 0.4
+    ///     concealedkiller_/craftsmann_/powerhouse_/teufort_: 0.6
+    #[arg(long, default_value_t = 0.4)]
+    scale_min: f32,
+
+    /// Paintkit scale_uv range maximum (e.g. 0.5 or 0.7).
+    #[arg(long, default_value_t = 0.5)]
+    scale_max: f32,
+
+    /// Texture used at WW/BS wear. Group A paintkits (harvest, gentlemanne,
+    /// pyroland, warbird) shift to `paint_blood_buckets` at wears 4 and 5.
+    /// Group B (concealedkiller, craftsmann, powerhouse, teufort) keeps
+    /// `paint_blood` at all wears.
+    #[arg(long, default_value = "paint_blood_buckets",
+          value_parser = ["paint_blood", "paint_blood_buckets"])]
+    bs_pattern: String,
+
+    /// Run BOTH known sniper-rifle paintkit configurations and emit one CSV
+    /// per group. Group A = harvest/gentlemanne/pyroland/warbird (scale 0.4-0.5,
+    /// BS texture = paint_blood_buckets). Group B = concealedkiller/craftsmann/
+    /// powerhouse/teufort (scale 0.6-0.7, BS texture = paint_blood). Output
+    /// goes to `<out>/bloodscopes_group_a.csv` and `<out>/bloodscopes_group_b.csv`.
+    #[arg(long)]
+    all_configs: bool,
+
     /// Only run the self-test and exit.
     #[arg(long)]
     self_test: bool,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct PaintkitConfig {
+    label:       &'static str,
+    scale_min:   f32,
+    scale_max:   f32,
+    bs_buckets:  bool,
+    csv_suffix:  &'static str,
+}
+
+const CONFIG_GROUP_A: PaintkitConfig = PaintkitConfig {
+    label:      "Group A (harvest/gentlemanne/pyroland/warbird)",
+    scale_min:  0.4, scale_max: 0.5,
+    bs_buckets: true,
+    csv_suffix: "_group_a",
+};
+const CONFIG_GROUP_B: PaintkitConfig = PaintkitConfig {
+    label:      "Group B (concealedkiller/craftsmann/powerhouse/teufort)",
+    scale_min:  0.6, scale_max: 0.7,
+    bs_buckets: false,
+    csv_suffix: "_group_b",
+};
 
 fn default_assets_dir() -> PathBuf {
     // Assume binary is run from the repo or from rust_bloodscope/
@@ -463,8 +614,10 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // 2. Load patterns
-    let assets = args.assets.unwrap_or_else(default_assets_dir);
+    // 2. Load BOTH base patterns. Per-config processing decides which one
+    //    is used as the BS column (paint_blood_buckets for Group A,
+    //    paint_blood itself for Group B).
+    let assets = args.assets.clone().unwrap_or_else(default_assets_dir);
     let ft_path      = assets.join("paint_blood.png");
     let buckets_path = assets.join("paint_blood_buckets.png");
 
@@ -472,24 +625,16 @@ fn main() -> std::io::Result<()> {
     let wants_buckets = matches!(args.wear, Wear::Buckets | Wear::Both);
 
     eprintln!("Loading patterns from {:?}", assets);
-    let pat_ft      = if wants_ft { load_pattern(&ft_path) } else { Vec::new() };
-    let pat_buckets = if wants_buckets { load_pattern(&buckets_path) } else { Vec::new() };
-    let bloody_ft      = pat_ft.iter().map(|&b| b as u64).sum::<u64>();
+    let pat_blood   = load_pattern(&ft_path);
+    let pat_buckets = load_pattern(&buckets_path);
+    let bloody_blood   = pat_blood.iter().map(|&b| b as u64).sum::<u64>();
     let bloody_buckets = pat_buckets.iter().map(|&b| b as u64).sum::<u64>();
-    if wants_ft {
-        eprintln!(
-            "  paint_blood.png          -> {} bloody px ({:.3}%)",
-            bloody_ft,
-            100.0 * bloody_ft as f64 / (W * H) as f64
-        );
-    }
-    if wants_buckets {
-        eprintln!(
-            "  paint_blood_buckets.png  -> {} bloody px ({:.3}%)",
-            bloody_buckets,
-            100.0 * bloody_buckets as f64 / (W * H) as f64
-        );
-    }
+    eprintln!(
+        "  paint_blood.png          -> {} bloody px ({:.3}%)",
+        bloody_blood, 100.0 * bloody_blood as f64 / (W * H) as f64);
+    eprintln!(
+        "  paint_blood_buckets.png  -> {} bloody px ({:.3}%)",
+        bloody_buckets, 100.0 * bloody_buckets as f64 / (W * H) as f64);
 
     // 3. Precompute scope offsets (optionally subsampled)
     let mut offsets = scope_offsets_uv();
@@ -499,107 +644,78 @@ fn main() -> std::io::Result<()> {
     eprintln!("Scope disc: center=({},{})  r={}  {} pixels (subsample={})",
         SCOPE_CX, SCOPE_CY, SCOPE_R, offsets.len(), args.subsample);
 
-    // 4. Open output files
     std::fs::create_dir_all(&args.out)?;
+    let total = args.end - args.start;
+    eprintln!("Enumerating {} seeds [{}, {})\n", total, args.start, args.end);
+
+    // Decide which config(s) to run. With --all-configs we run both Group A
+    // and Group B back to back, writing per-config CSV files.
+    let configs: Vec<PaintkitConfig> = if args.all_configs {
+        vec![CONFIG_GROUP_A, CONFIG_GROUP_B]
+    } else {
+        vec![PaintkitConfig {
+            label:      "custom",
+            scale_min:  args.scale_min,
+            scale_max:  args.scale_max,
+            bs_buckets: args.bs_pattern == "paint_blood_buckets",
+            csv_suffix: "",
+        }]
+    };
+
+    // -------- GPU path --------
+    if args.gpu {
+        for cfg in &configs {
+            run_gpu_for_config(
+                *cfg, &pat_blood, &pat_buckets, &offsets,
+                &args, wants_ft, wants_buckets,
+            )?;
+        }
+        eprintln!("Output dir: {:?}", args.out);
+        return Ok(());
+    }
+
+    // -------- CPU path -- single config only (--all-configs is GPU-only) --
+    if args.all_configs {
+        eprintln!("--all-configs requires --gpu (CPU path is single-config only)");
+        std::process::exit(2);
+    }
+    let cfg = configs[0];
+    let pat_ft_use = if wants_ft { pat_blood.clone() } else { Vec::new() };
+    let pat_buckets_use = if wants_buckets {
+        if cfg.bs_buckets { pat_buckets.clone() } else { pat_blood.clone() }
+    } else { Vec::new() };
     let mut ft_writer = if wants_ft && args.full_binary {
         Some(BufWriter::with_capacity(
             1 << 20,
-            File::create(args.out.join("bloodscope_field_tested.u8"))?,
+            File::create(args.out.join(format!("bloodscope_field_tested{}.u8", cfg.csv_suffix)))?,
         ))
     } else { None };
     let mut bk_writer = if wants_buckets && args.full_binary {
         Some(BufWriter::with_capacity(
             1 << 20,
-            File::create(args.out.join("bloodscope_buckets.u8"))?,
+            File::create(args.out.join(format!("bloodscope_buckets{}.u8", cfg.csv_suffix)))?,
         ))
     } else { None };
     let mut csv_writer = if args.min_pct <= 100 {
         let mut w = BufWriter::with_capacity(
             1 << 20,
-            File::create(args.out.join("bloodscopes.csv"))?,
+            File::create(args.out.join(format!("bloodscopes{}.csv", cfg.csv_suffix)))?,
         );
         writeln!(w, "seed,field_tested_pct,well_worn_battle_scarred_pct")?;
         Some(w)
     } else { None };
-
-    let total = args.end - args.start;
-    eprintln!("Enumerating {} seeds [{}, {}) on {} threads\n",
-        total, args.start, args.end, rayon::current_num_threads());
-
-    // Combined (bit0=FT, bit1=Buckets) pattern for the dual path -- halves
-    // pattern lookups when both wears are requested.
-    let combined: Vec<u8> = if (wants_ft && wants_buckets) || args.gpu {
-        // GPU always uses combined regardless of --wear, since the shader
-        // unconditionally samples both bits. We'll mask off unwanted output.
-        let pf = if wants_ft      { &pat_ft[..]      } else { &vec![0u8; (W*H) as usize][..] };
-        let pb = if wants_buckets { &pat_buckets[..] } else { &vec![0u8; (W*H) as usize][..] };
+    // Combined (bit0=FT, bit1=Buckets) pattern for the dual path
+    let combined: Vec<u8> = if wants_ft && wants_buckets {
+        let pf = &pat_ft_use;
+        let pb = &pat_buckets_use;
         let mut out = vec![0u8; (W * H) as usize];
         for i in 0..out.len() {
             out[i] = (pf[i] & 1) | ((pb[i] & 1) << 1);
         }
         out
-    } else {
-        Vec::new()
-    };
-
-    // -------- GPU path --------
-    if args.gpu {
-        eprintln!("Initializing GPU...");
-        let runner = pollster::block_on(gpu::GpuRunner::new(
-            &offsets,
-            &combined,
-            args.gpu_batch,
-        )).unwrap_or_else(|e| {
-            eprintln!("GPU init failed: {e}");
-            std::process::exit(3);
-        });
-
-        let t0 = Instant::now();
-        let pb = make_pb(total, "GPU");
-
-        let mut cur = args.start;
-        while cur < args.end {
-            let remaining = (args.end - cur).min(args.gpu_batch as u64);
-            let n = remaining as u32;
-            let packed = runner.run_batch(cur, n);
-
-            // Unpack to two Vec<u8>
-            let mut ft_buf = if wants_ft      { Vec::with_capacity(n as usize) } else { Vec::new() };
-            let mut bk_buf = if wants_buckets { Vec::with_capacity(n as usize) } else { Vec::new() };
-            for &w in &packed {
-                if wants_ft      { ft_buf.push( (w & 0xFF) as u8); }
-                if wants_buckets { bk_buf.push(((w >> 8) & 0xFF) as u8); }
-            }
-
-            if let Some(w) = ft_writer.as_mut() { w.write_all(&ft_buf)?; }
-            if let Some(w) = bk_writer.as_mut() { w.write_all(&bk_buf)?; }
-            if let Some(w) = csv_writer.as_mut() {
-                let min = args.min_pct;
-                for i in 0..n as usize {
-                    let fv = if wants_ft { ft_buf[i] } else { 0 };
-                    let bv = if wants_buckets { bk_buf[i] } else { 0 };
-                    if fv >= min || bv >= min {
-                        writeln!(w, "{},{},{}", cur + i as u64, fv, bv)?;
-                    }
-                }
-            }
-
-            cur  += n as u64;
-            pb.inc(n as u64);
-        }
-
-        pb.finish_with_message("done");
-
-        if let Some(w) = ft_writer.as_mut()  { w.flush()?; }
-        if let Some(w) = bk_writer.as_mut()  { w.flush()?; }
-        if let Some(w) = csv_writer.as_mut() { w.flush()?; }
-
-        let elapsed = t0.elapsed().as_secs_f64();
-        eprintln!("Done (GPU: {}). {} seeds in {:.1}s  ({:.0} seed/s)",
-            runner.adapter_name, total, elapsed, total as f64 / elapsed);
-        eprintln!("Output dir: {:?}", args.out);
-        return Ok(());
-    }
+    } else { Vec::new() };
+    let pat_ft = pat_ft_use;
+    let pat_buckets = pat_buckets_use;
 
     let t0 = Instant::now();
     let chunk = args.chunk.min(total);
@@ -611,19 +727,20 @@ fn main() -> std::io::Result<()> {
         let n  = (hi - cur) as usize;
 
         // Produce chunks in parallel
+        let scale_range = (cfg.scale_min, cfg.scale_max);
         let (ft_buf, bk_buf): (Vec<u8>, Vec<u8>) = if wants_ft && wants_buckets {
             (0..n as u64)
                 .into_par_iter()
-                .map(|i| coverage_pct_both(cur + i, &combined, &offsets))
+                .map(|i| coverage_pct_both(cur + i, &combined, &offsets, scale_range))
                 .unzip()
         } else if wants_ft {
             let v: Vec<u8> = (0..n as u64).into_par_iter()
-                .map(|i| coverage_pct_one(cur + i, &pat_ft, &offsets))
+                .map(|i| coverage_pct_one(cur + i, &pat_ft, &offsets, scale_range))
                 .collect();
             (v, Vec::new())
         } else {
             let v: Vec<u8> = (0..n as u64).into_par_iter()
-                .map(|i| coverage_pct_one(cur + i, &pat_buckets, &offsets))
+                .map(|i| coverage_pct_one(cur + i, &pat_buckets, &offsets, scale_range))
                 .collect();
             (Vec::new(), v)
         };

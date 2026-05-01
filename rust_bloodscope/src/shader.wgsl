@@ -30,6 +30,10 @@ struct Params {
     start_hi:    u32,    // high 32 bits of first seed in this dispatch
     num_seeds:   u32,    // number of seeds in this dispatch
     num_offsets: u32,    // length of `offsets`
+    scale_min:   f32,    // paintkit-specific scale_uv range minimum
+    scale_max:   f32,    // paintkit-specific scale_uv range maximum
+    _pad0:       u32,
+    _pad1:       u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -122,7 +126,7 @@ fn cs_bloodscope(
     let tu    = rng_float(&rng, 0.0, 1.0);
     let tv    = rng_float(&rng, 0.0, 1.0);
     let rot   = rng_float(&rng, 0.0, 360.0);
-    let scale = rng_float(&rng, 0.4, 0.5);
+    let scale = rng_float(&rng, params.scale_min, params.scale_max);
 
     // 2. Factor transform once per seed
     let rad = rot * DEG2RAD;

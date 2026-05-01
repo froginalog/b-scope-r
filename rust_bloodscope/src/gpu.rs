@@ -17,6 +17,10 @@ struct Params {
     start_hi:    u32,
     num_seeds:   u32,
     num_offsets: u32,
+    scale_min:   f32,
+    scale_max:   f32,
+    _pad0:       u32,
+    _pad1:       u32,
 }
 
 #[repr(C)]
@@ -242,7 +246,15 @@ impl GpuRunner {
 
     /// Process `num_seeds` seeds starting at `start_seed` and return a
     /// packed u32 per seed: low byte = FT pct, second byte = Buckets pct.
-    pub fn run_batch(&self, start_seed: u64, num_seeds: u32) -> Vec<u32> {
+    /// `scale_range` is the paintkit's `scale_uv` range -- e.g. (0.4, 0.5)
+    /// for harvest/gentlemanne/pyroland/warbird, (0.6, 0.7) for the
+    /// concealedkiller/craftsmann/powerhouse/teufort family.
+    pub fn run_batch(
+        &self,
+        start_seed: u64,
+        num_seeds: u32,
+        scale_range: (f32, f32),
+    ) -> Vec<u32> {
         assert!(num_seeds <= self.batch_size);
 
         // 1. Upload params (pass full 64-bit start seed as two u32s)
@@ -251,6 +263,10 @@ impl GpuRunner {
             start_hi:    (start_seed >> 32) as u32,
             num_seeds,
             num_offsets: self.num_offsets,
+            scale_min:   scale_range.0,
+            scale_max:   scale_range.1,
+            _pad0:       0,
+            _pad1:       0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
