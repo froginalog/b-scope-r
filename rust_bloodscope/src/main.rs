@@ -23,7 +23,85 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use image::GenericImageView;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
+
+// -- Progress bar -----------------------------------------------------------
+//
+// Custom TermLike that always writes to stderr regardless of TTY status.
+// indicatif's default `ProgressDrawTarget::stderr_with_hz` wraps a
+// `console::Term` whose `is_term()` returns false when stderr is piped, and
+// the indicatif draw target then reports itself hidden -- so the bar
+// silently disappears when the user redirects output. Wrapping stderr in
+// our own TermLike sidesteps that hidden check.
+#[derive(Debug)]
+struct AlwaysStderr;
+
+impl indicatif::TermLike for AlwaysStderr {
+    fn width(&self) -> u16 { 80 }
+    fn write_line(&self, s: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut h = std::io::stderr().lock();
+        h.write_all(s.as_bytes())?;
+        h.write_all(b"\n")?;
+        Ok(())
+    }
+    fn write_str(&self, s: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        std::io::stderr().lock().write_all(s.as_bytes())
+    }
+    fn clear_line(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        std::io::stderr().lock().write_all(b"\x1b[2K\r")
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        std::io::stderr().lock().flush()
+    }
+    fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
+        use std::io::Write;
+        if n > 0 {
+            write!(std::io::stderr().lock(), "\x1b[{n}A")
+        } else { Ok(()) }
+    }
+    fn move_cursor_down(&self, n: usize) -> std::io::Result<()> {
+        use std::io::Write;
+        if n > 0 {
+            write!(std::io::stderr().lock(), "\x1b[{n}B")
+        } else { Ok(()) }
+    }
+    fn move_cursor_left(&self, n: usize) -> std::io::Result<()> {
+        use std::io::Write;
+        if n > 0 {
+            write!(std::io::stderr().lock(), "\x1b[{n}D")
+        } else { Ok(()) }
+    }
+    fn move_cursor_right(&self, n: usize) -> std::io::Result<()> {
+        use std::io::Write;
+        if n > 0 {
+            write!(std::io::stderr().lock(), "\x1b[{n}C")
+        } else { Ok(()) }
+    }
+}
+
+fn make_pb(total: u64, tag: &str) -> ProgressBar {
+    let target = ProgressDrawTarget::term_like_with_hz(
+        Box::new(AlwaysStderr), 10);
+    let pb = ProgressBar::with_draw_target(Some(total), target);
+    let template = format!(
+        "[{}] {{elapsed_precise}} [{{wide_bar:.cyan/blue}}] {{percent:>3}}% \
+         {{pos:>13}}/{{len}} ({{per_sec:>10}}, eta {{eta_precise}}) {{msg}}",
+        tag
+    );
+    pb.set_style(
+        ProgressStyle::with_template(&template)
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(250));
+    pb
+}
+
 
 // -- Texture + scope geometry (must match paint_blood_circle_coverage.py) ----
 const W: u32 = 2048;
@@ -477,8 +555,7 @@ fn main() -> std::io::Result<()> {
         });
 
         let t0 = Instant::now();
-        let mut done: u64 = 0;
-        let mut next_report = Instant::now() + std::time::Duration::from_secs(2);
+        let pb = make_pb(total, "GPU");
 
         let mut cur = args.start;
         while cur < args.end {
@@ -507,37 +584,26 @@ fn main() -> std::io::Result<()> {
                 }
             }
 
-            done += n as u64;
             cur  += n as u64;
-
-            if Instant::now() >= next_report {
-                let elapsed = t0.elapsed().as_secs_f64();
-                let rate    = done as f64 / elapsed;
-                let eta     = (total - done) as f64 / rate;
-                eprintln!(
-                    "  {:>12}/{} seeds  ({:5.2}%)  {:>10.0} seed/s  elapsed {:.0}s  ETA {:.0}s",
-                    done, total, 100.0 * done as f64 / total as f64,
-                    rate, elapsed, eta
-                );
-                next_report = Instant::now() + std::time::Duration::from_secs(5);
-            }
+            pb.inc(n as u64);
         }
+
+        pb.finish_with_message("done");
 
         if let Some(w) = ft_writer.as_mut()  { w.flush()?; }
         if let Some(w) = bk_writer.as_mut()  { w.flush()?; }
         if let Some(w) = csv_writer.as_mut() { w.flush()?; }
 
         let elapsed = t0.elapsed().as_secs_f64();
-        eprintln!("\nDone (GPU: {}). {} seeds in {:.1}s  ({:.0} seed/s)",
+        eprintln!("Done (GPU: {}). {} seeds in {:.1}s  ({:.0} seed/s)",
             runner.adapter_name, total, elapsed, total as f64 / elapsed);
         eprintln!("Output dir: {:?}", args.out);
         return Ok(());
     }
 
     let t0 = Instant::now();
-    let mut done: u64 = 0;
     let chunk = args.chunk.min(total);
-    let mut next_report = Instant::now() + std::time::Duration::from_secs(2);
+    let pb = make_pb(total, "CPU");
 
     let mut cur = args.start;
     while cur < args.end {
@@ -577,28 +643,18 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        done += n as u64;
+        pb.inc(n as u64);
         cur   = hi;
-
-        if Instant::now() >= next_report {
-            let elapsed = t0.elapsed().as_secs_f64();
-            let rate    = done as f64 / elapsed;
-            let eta     = (total - done) as f64 / rate;
-            eprintln!(
-                "  {:>12}/{} seeds  ({:5.2}%)  {:>9.0} seed/s  elapsed {:.0}s  ETA {:.0}s",
-                done, total, 100.0 * done as f64 / total as f64,
-                rate, elapsed, eta
-            );
-            next_report = Instant::now() + std::time::Duration::from_secs(5);
-        }
     }
+
+    pb.finish_with_message("done");
 
     if let Some(w) = ft_writer.as_mut()  { w.flush()?; }
     if let Some(w) = bk_writer.as_mut()  { w.flush()?; }
     if let Some(w) = csv_writer.as_mut() { w.flush()?; }
 
     let elapsed = t0.elapsed().as_secs_f64();
-    eprintln!("\nDone. {} seeds in {:.1}s  ({:.0} seed/s)",
+    eprintln!("Done. {} seeds in {:.1}s  ({:.0} seed/s)",
         total, elapsed, total as f64 / elapsed);
     eprintln!("Output dir: {:?}", args.out);
     if args.full_binary && wants_ft {
