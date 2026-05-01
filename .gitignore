@@ -23,10 +23,9 @@ _textures_preview/
 _paintkits_master.txt
 verify_out/
 verify_out_small/
-market_bloodscopes.csv
-test_market.csv
-test_seeds.csv
 
-# Local cache for resolved listing_id -> seed mappings
-.seed_cache.json
-market_bloodscopes.csv
+# CSV outputs from the Rust GPU enumerator (can hit ~85 GB at 2^32 seeds,
+# never commit). Run `cargo run --release -- --gpu --min-pct 0` to generate.
+rust_bloodscope/csv_test/
+rust_bloodscope/bloodscope_out/
+*.bloodscope.csv
