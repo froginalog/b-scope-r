@@ -103,7 +103,7 @@ fn make_pb(total: u64, tag: &str) -> ProgressBar {
 }
 
 
-// -- Per-config GPU enumeration ---------------------------------------------
+// -- Per-config single-pass GPU run -----------------------------------------
 fn run_gpu_for_config(
     cfg: PaintkitConfig,
     pat_blood: &[u8],
@@ -118,8 +118,6 @@ fn run_gpu_for_config(
     eprintln!("  bs texture = {}",
         if cfg.bs_buckets { "paint_blood_buckets" } else { "paint_blood" });
 
-    // Build combined bitmap: bit0 = FT (always paint_blood),
-    // bit1 = BS (paint_blood_buckets for Group A, paint_blood for Group B).
     let pf = pat_blood;
     let pb = if cfg.bs_buckets { pat_buckets } else { pat_blood };
     let mut combined = vec![0u8; pf.len()];
@@ -127,20 +125,11 @@ fn run_gpu_for_config(
         combined[i] = (pf[i] & 1) | ((pb[i] & 1) << 1);
     }
 
-    // Per-config output paths (suffix lets two configs coexist).
     let csv_path = args.out.join(format!("bloodscopes{}.csv", cfg.csv_suffix));
     let mut csv_writer = if args.min_pct <= 100 {
         let mut w = BufWriter::with_capacity(1 << 20, File::create(&csv_path)?);
         writeln!(w, "seed,field_tested_pct,well_worn_battle_scarred_pct")?;
         Some(w)
-    } else { None };
-    let mut ft_writer = if wants_ft && args.full_binary {
-        Some(BufWriter::with_capacity(1 << 20, File::create(args.out.join(
-            format!("bloodscope_field_tested{}.u8", cfg.csv_suffix)))?))
-    } else { None };
-    let mut bk_writer = if wants_buckets && args.full_binary {
-        Some(BufWriter::with_capacity(1 << 20, File::create(args.out.join(
-            format!("bloodscope_buckets{}.u8", cfg.csv_suffix)))?))
     } else { None };
 
     eprintln!("Initializing GPU...");
@@ -161,20 +150,11 @@ fn run_gpu_for_config(
         let n = remaining as u32;
         let packed = runner.run_batch(cur, n, (cfg.scale_min, cfg.scale_max));
 
-        let mut ft_buf = if wants_ft      { Vec::with_capacity(n as usize) } else { Vec::new() };
-        let mut bk_buf = if wants_buckets { Vec::with_capacity(n as usize) } else { Vec::new() };
-        for &w in &packed {
-            if wants_ft      { ft_buf.push( (w & 0xFF) as u8); }
-            if wants_buckets { bk_buf.push(((w >> 8) & 0xFF) as u8); }
-        }
-
-        if let Some(w) = ft_writer.as_mut() { w.write_all(&ft_buf)?; }
-        if let Some(w) = bk_writer.as_mut() { w.write_all(&bk_buf)?; }
         if let Some(w) = csv_writer.as_mut() {
             let min = args.min_pct;
-            for i in 0..n as usize {
-                let fv = if wants_ft { ft_buf[i] } else { 0 };
-                let bv = if wants_buckets { bk_buf[i] } else { 0 };
+            for (i, &word) in packed.iter().enumerate() {
+                let fv = ( word        & 0xFF) as u8;
+                let bv = ((word >> 8) & 0xFF) as u8;
                 if fv >= min || bv >= min {
                     writeln!(w, "{},{},{}", cur + i as u64, fv, bv)?;
                 }
@@ -186,14 +166,196 @@ fn run_gpu_for_config(
     }
     pb_progress.finish_with_message("done");
 
-    if let Some(w) = ft_writer.as_mut()  { w.flush()?; }
-    if let Some(w) = bk_writer.as_mut()  { w.flush()?; }
+    let _ = (wants_ft, wants_buckets);  // (binary dump path is handled elsewhere now)
     if let Some(w) = csv_writer.as_mut() { w.flush()?; }
 
     let elapsed = t0.elapsed().as_secs_f64();
     eprintln!("Done (GPU: {}). {} seeds in {:.1}s  ({:.0} seed/s)",
         runner.adapter_name, total, elapsed, total as f64 / elapsed);
     eprintln!("CSV: {:?}\n", csv_path);
+    Ok(())
+}
+
+
+// -- Combined-config GPU run (all 4 groups in one pass per seed) ------------
+//
+// Computes Group A FT, Group A BS, Group B, and Group D in a single dispatch
+// per seed. Group C is identical to Group A FT (same texture + same scale),
+// so we just write the Group A FT column to bloodscopes_group_c.csv as well.
+//
+// `adapters_share` describes the seed-range fraction each GPU should handle.
+// For example with two GPUs of (relative) speeds [3, 1], pass [0.75, 0.25].
+fn run_all_configs(
+    pat_blood: &[u8],
+    pat_buckets: &[u8],
+    offsets: &[(f32, f32)],
+    args: &Args,
+    adapters: Vec<wgpu::Adapter>,
+    shares: Vec<f64>,
+) -> std::io::Result<()> {
+    assert_eq!(adapters.len(), shares.len());
+
+    // Build combined bitmap once (bit 0 = paint_blood, bit 1 = paint_blood_buckets).
+    let mut combined = vec![0u8; pat_blood.len()];
+    for i in 0..pat_blood.len() {
+        combined[i] = (pat_blood[i] & 1) | ((pat_buckets[i] & 1) << 1);
+    }
+
+    let total = args.end - args.start;
+    let total_share: f64 = shares.iter().sum();
+    let mut starts = vec![args.start];
+    let mut acc = 0.0_f64;
+    for s in &shares[..shares.len() - 1] {
+        acc += *s / total_share;
+        starts.push(args.start + ((total as f64) * acc) as u64);
+    }
+    starts.push(args.end);  // sentinel
+    // starts[i]..starts[i+1] = the i-th adapter's seed range.
+
+    // CSV writers: each adapter writes to its own per-shard temp file so we
+    // don't have to lock. After all shards finish we concatenate them.
+    std::fs::create_dir_all(&args.out)?;
+    let labels = ["a", "b", "c", "d"];
+    // Lazy: just write to one final file per group. To avoid lock contention
+    // each thread writes per-shard files and we cat them after.
+    let shard_files: Vec<_> = (0..adapters.len()).map(|gi| {
+        labels.iter().map(|lbl| {
+            args.out.join(format!("_shard{}_group_{}.csv", gi, lbl))
+        }).collect::<Vec<_>>()
+    }).collect();
+
+    let progress_total = total;
+    let pb_progress = std::sync::Arc::new(make_pb(progress_total, "GPU"));
+
+    eprintln!("Sharding {} seeds across {} GPU(s):", total, adapters.len());
+    for (gi, (a, share)) in adapters.iter().zip(shares.iter()).enumerate() {
+        let info = a.get_info();
+        let lo = starts[gi];
+        let hi = starts[gi + 1];
+        eprintln!(
+            "  GPU{}: {} -- {:.0}% ({} seeds, range {}..{})",
+            gi, info.name,
+            100.0 * share / total_share,
+            hi - lo, lo, hi);
+    }
+    eprintln!();
+
+    let scales_a = (0.4_f32, 0.5_f32);
+    let scales_b = (0.6_f32, 0.7_f32);
+    let scales_d = (0.2_f32, 0.3_f32);
+
+    let t0 = Instant::now();
+
+    std::thread::scope(|scope| -> std::io::Result<()> {
+        let mut handles = Vec::new();
+        for (gi, adapter) in adapters.into_iter().enumerate() {
+            let lo = starts[gi];
+            let hi = starts[gi + 1];
+            if lo >= hi { continue; }
+            let combined = &combined;
+            let offsets  = &offsets;
+            let args     = &args;
+            let pb_progress = pb_progress.clone();
+            let shard_paths = shard_files[gi].clone();
+
+            handles.push(scope.spawn(move || -> std::io::Result<()> {
+                let runner = pollster::block_on(gpu::GpuRunner::new_with_adapter(
+                    adapter, offsets, combined, args.gpu_batch
+                )).unwrap_or_else(|e| {
+                    eprintln!("GPU{} init failed: {e}", gi);
+                    std::process::exit(3);
+                });
+
+                let mut writers: Vec<_> = shard_paths.iter().map(|p| {
+                    BufWriter::with_capacity(1 << 20,
+                        File::create(p).expect("create shard"))
+                }).collect();
+                if args.min_pct <= 100 {
+                    for w in writers.iter_mut() {
+                        writeln!(w, "seed,field_tested_pct,well_worn_battle_scarred_pct")?;
+                    }
+                }
+
+                let mut cur = lo;
+                while cur < hi {
+                    let remaining = (hi - cur).min(args.gpu_batch as u64);
+                    let n = remaining as u32;
+                    let packed = runner.run_batch_multi(
+                        cur, n, scales_a, scales_b, scales_d);
+
+                    if args.min_pct <= 100 {
+                        let min = args.min_pct;
+                        for (i, &word) in packed.iter().enumerate() {
+                            let a_ft = ( word         & 0xFF) as u8;
+                            let a_bs = ((word >> 8) & 0xFF) as u8;
+                            let b    = ((word >> 16) & 0xFF) as u8;
+                            let d    = ((word >> 24) & 0xFF) as u8;
+                            let seed = cur + i as u64;
+                            // Group A
+                            if a_ft >= min || a_bs >= min {
+                                writeln!(writers[0], "{seed},{a_ft},{a_bs}")?;
+                            }
+                            // Group B (FT == BS at this scale + texture)
+                            if b >= min {
+                                writeln!(writers[1], "{seed},{b},{b}")?;
+                            }
+                            // Group C (= Group A FT, but in its own file so users
+                            // can grep by group without remembering the alias)
+                            if a_ft >= min {
+                                writeln!(writers[2], "{seed},{a_ft},{a_ft}")?;
+                            }
+                            // Group D (FT == BS at this scale + texture)
+                            if d >= min {
+                                writeln!(writers[3], "{seed},{d},{d}")?;
+                            }
+                        }
+                    }
+                    cur += n as u64;
+                    pb_progress.inc(n as u64);
+                }
+                for w in writers.iter_mut() { w.flush()?; }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().expect("shard thread panicked")?;
+        }
+        Ok(())
+    })?;
+
+    pb_progress.finish_with_message("done");
+
+    // Concatenate per-shard CSVs into a single file per group.
+    // Shard 0's file already has the header line; subsequent shards must skip
+    // their first line.
+    for (gi_label_idx, lbl) in labels.iter().enumerate() {
+        let final_path = args.out.join(format!("bloodscopes_group_{}.csv", lbl));
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(&final_path)?);
+        for gi in 0..shard_files.len() {
+            let p = &shard_files[gi][gi_label_idx];
+            if !p.exists() { continue; }
+            let mut f = std::io::BufReader::new(File::open(p)?);
+            use std::io::BufRead;
+            let mut first = true;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes = f.read_line(&mut line)?;
+                if bytes == 0 { break; }
+                if first && gi > 0 { first = false; continue; }
+                first = false;
+                out.write_all(line.as_bytes())?;
+            }
+            std::fs::remove_file(p).ok();
+        }
+        out.flush()?;
+        eprintln!("CSV: {:?}", final_path);
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "\nAll-configs done. {} seeds in {:.1}s  ({:.0} seed/s aggregate)",
+        total, elapsed, total as f64 / elapsed);
     Ok(())
 }
 
@@ -551,13 +713,22 @@ struct Args {
           value_parser = ["paint_blood", "paint_blood_buckets"])]
     bs_pattern: String,
 
-    /// Run BOTH known sniper-rifle paintkit configurations and emit one CSV
-    /// per group. Group A = harvest/gentlemanne/pyroland/warbird (scale 0.4-0.5,
-    /// BS texture = paint_blood_buckets). Group B = concealedkiller/craftsmann/
-    /// powerhouse/teufort (scale 0.6-0.7, BS texture = paint_blood). Output
-    /// goes to `<out>/bloodscopes_group_a.csv` and `<out>/bloodscopes_group_b.csv`.
+    /// Run all four paintkit-group bloodscope configurations in ONE
+    /// combined GPU pass per seed and emit four CSVs:
+    ///   bloodscopes_group_a.csv   (scale 0.4-0.5, BS=paint_blood_buckets)
+    ///   bloodscopes_group_b.csv   (scale 0.6-0.7, BS=paint_blood)
+    ///   bloodscopes_group_c.csv   (scale 0.4-0.5, BS=paint_blood; same as A.FT)
+    ///   bloodscopes_group_d.csv   (scale 0.2-0.3, BS=paint_blood)
+    /// See paintkit_groups.txt at the repo root for which paintkit lives in
+    /// which group.
     #[arg(long)]
     all_configs: bool,
+
+    /// Shard work across every available GPU instead of just one. The
+    /// seed range is split proportionally between adapters so a slower
+    /// secondary card finishes around the same time as the primary one.
+    #[arg(long)]
+    multi_gpu: bool,
 
     /// Only run the self-test and exit.
     #[arg(long)]
@@ -648,31 +819,86 @@ fn main() -> std::io::Result<()> {
     let total = args.end - args.start;
     eprintln!("Enumerating {} seeds [{}, {})\n", total, args.start, args.end);
 
-    // Decide which config(s) to run. With --all-configs we run both Group A
-    // and Group B back to back, writing per-config CSV files.
-    let configs: Vec<PaintkitConfig> = if args.all_configs {
-        vec![CONFIG_GROUP_A, CONFIG_GROUP_B]
-    } else {
-        vec![PaintkitConfig {
+    // -------- GPU path --------
+    if args.gpu {
+        if args.all_configs {
+            // Combined-config + multi-GPU path. Computes Group A FT/BS,
+            // Group B, Group C (= A FT), and Group D in ONE shader pass per
+            // seed. Optionally shards across every GPU on the host.
+            let mut adapter_choices = if args.multi_gpu {
+                gpu::GpuRunner::enumerate_adapters()
+            } else {
+                let inst = wgpu::Instance::default();
+                let a = pollster::block_on(inst.request_adapter(
+                    &wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: None,
+                        force_fallback_adapter: false,
+                    })).expect("no GPU");
+                let info = a.get_info();
+                vec![(a, info)]
+            };
+            // Sort by power so the strongest GPU lands first; we estimate
+            // throughput from device_type + name (RTX/RX flagships > older
+            // cards). Without a benchmark we fall back to equal shares
+            // per discrete GPU and a small share for integrated chips.
+            adapter_choices.sort_by_key(|(_, info)| match info.device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                _ => 1,
+            });
+            let adapters: Vec<wgpu::Adapter> = adapter_choices.iter().map(|(a, _)| a.clone()).collect();
+            let shares: Vec<f64> = adapter_choices.iter().map(|(_, info)| {
+                // Crude relative-speed heuristic until we benchmark for real.
+                // Discrete GPUs default to 1.0; the second discrete GPU on
+                // the host is presumed slower (e.g. an RTX 2060 next to a
+                // 3090) so we down-weight subsequent discretes a bit.
+                let base = match info.device_type {
+                    wgpu::DeviceType::DiscreteGpu => 1.0,
+                    wgpu::DeviceType::IntegratedGpu => 0.15,
+                    _ => 0.05,
+                };
+                // Knock down anything that doesn't look like a flagship name.
+                let n = info.name.to_lowercase();
+                let bonus = if n.contains("rtx 30") || n.contains("rtx 40")
+                            || n.contains("rx 7") || n.contains("rx 6") {
+                    1.0
+                } else if n.contains("rtx 20") || n.contains("rx 5") {
+                    0.4
+                } else { 0.6 };
+                base * bonus
+            }).collect();
+
+            run_all_configs(
+                &pat_blood, &pat_buckets, &offsets, &args,
+                adapters, shares,
+            )?;
+            eprintln!("Output dir: {:?}", args.out);
+            return Ok(());
+        }
+        // Single-config explicit run with --scale-min / --scale-max / --bs-pattern.
+        let cfg = PaintkitConfig {
             label:      "custom",
             scale_min:  args.scale_min,
             scale_max:  args.scale_max,
             bs_buckets: args.bs_pattern == "paint_blood_buckets",
             csv_suffix: "",
-        }]
-    };
-
-    // -------- GPU path --------
-    if args.gpu {
-        for cfg in &configs {
-            run_gpu_for_config(
-                *cfg, &pat_blood, &pat_buckets, &offsets,
-                &args, wants_ft, wants_buckets,
-            )?;
-        }
+        };
+        run_gpu_for_config(
+            cfg, &pat_blood, &pat_buckets, &offsets,
+            &args, wants_ft, wants_buckets,
+        )?;
         eprintln!("Output dir: {:?}", args.out);
         return Ok(());
     }
+
+    // CPU path needs a single PaintkitConfig.
+    let configs: Vec<PaintkitConfig> = vec![PaintkitConfig {
+        label:      "custom",
+        scale_min:  args.scale_min,
+        scale_max:  args.scale_max,
+        bs_buckets: args.bs_pattern == "paint_blood_buckets",
+        csv_suffix: "",
+    }];
 
     // -------- CPU path -- single config only (--all-configs is GPU-only) --
     if args.all_configs {

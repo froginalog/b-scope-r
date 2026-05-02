@@ -13,14 +13,18 @@ const WORKGROUP_SIZE: u32 = 64;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Params {
-    start_lo:    u32,
-    start_hi:    u32,
-    num_seeds:   u32,
-    num_offsets: u32,
-    scale_min:   f32,
-    scale_max:   f32,
-    _pad0:       u32,
-    _pad1:       u32,
+    start_lo:     u32,
+    start_hi:     u32,
+    num_seeds:    u32,
+    num_offsets:  u32,
+    scale_a_min:  f32,
+    scale_a_max:  f32,
+    scale_b_min:  f32,
+    scale_b_max:  f32,
+    scale_d_min:  f32,
+    scale_d_max:  f32,
+    multi_config: u32,
+    _pad:         u32,
 }
 
 #[repr(C)]
@@ -47,6 +51,28 @@ pub struct GpuRunner {
 }
 
 impl GpuRunner {
+    /// Enumerate every physical GPU on the host. Restricts to the Vulkan
+    /// backend because:
+    ///   * DX12's FXC HLSL translator chokes on the WGSL we emit (dynamic
+    ///     indexing into the per-thread RNG state array forces a loop
+    ///     unroll that exceeds FXC limits)
+    ///   * each physical card shows up once per backend, so without
+    ///     filtering we'd see the same RTX 3090 twice and run twice as
+    ///     many shards as there are GPUs
+    /// Vulkan works on every modern driver and gives consistent perf.
+    pub fn enumerate_adapters() -> Vec<(wgpu::Adapter, wgpu::AdapterInfo)> {
+        let instance = wgpu::Instance::default();
+        instance
+            .enumerate_adapters(wgpu::Backends::VULKAN)
+            .into_iter()
+            .map(|a| {
+                let info = a.get_info();
+                (a, info)
+            })
+            .filter(|(_, info)| info.device_type != wgpu::DeviceType::Cpu)
+            .collect()
+    }
+
     pub async fn new(
         offsets: &[(f32, f32)],
         combined_pattern: &[u8],
@@ -61,6 +87,17 @@ impl GpuRunner {
             })
             .await
             .map_err(|e| format!("no GPU adapter: {e}"))?;
+        Self::new_with_adapter(adapter, offsets, combined_pattern, batch_size).await
+    }
+
+    /// Build a GpuRunner around a specific adapter (e.g. when sharding work
+    /// across multiple GPUs in the same machine).
+    pub async fn new_with_adapter(
+        adapter: wgpu::Adapter,
+        offsets: &[(f32, f32)],
+        combined_pattern: &[u8],
+        batch_size: u32,
+    ) -> Result<Self, String> {
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         eprintln!("GPU: {adapter_name}");
@@ -244,29 +281,65 @@ impl GpuRunner {
         })
     }
 
-    /// Process `num_seeds` seeds starting at `start_seed` and return a
-    /// packed u32 per seed: low byte = FT pct, second byte = Buckets pct.
-    /// `scale_range` is the paintkit's `scale_uv` range -- e.g. (0.4, 0.5)
-    /// for harvest/gentlemanne/pyroland/warbird, (0.6, 0.7) for the
-    /// concealedkiller/craftsmann/powerhouse/teufort family.
+    /// Single-config dispatch: each output u32 packs (FT pct, BS pct) in
+    /// the low two bytes. Use `run_batch_multi` to compute all four
+    /// paintkit-group bloodscopes in one pass.
     pub fn run_batch(
         &self,
         start_seed: u64,
         num_seeds: u32,
         scale_range: (f32, f32),
     ) -> Vec<u32> {
+        self.run_batch_inner(start_seed, num_seeds,
+            (scale_range.0, scale_range.1),
+            (0.0, 0.0), (0.0, 0.0),
+            false)
+    }
+
+    /// Multi-config dispatch: compute Group A (paint_blood + paint_blood_buckets
+    /// at scale_a), Group B (paint_blood at scale_b), and Group D (paint_blood
+    /// at scale_d) in ONE pass per seed. Each output u32 has 4 bytes:
+    ///   bits  0..7  = Group A FT (= Group C)
+    ///   bits  8..15 = Group A BS
+    ///   bits 16..23 = Group B
+    ///   bits 24..31 = Group D
+    /// The combined `pattern` MUST be the (paint_blood | paint_blood_buckets<<1)
+    /// bitmap so all four lookups can share it.
+    pub fn run_batch_multi(
+        &self,
+        start_seed: u64,
+        num_seeds: u32,
+        scale_a: (f32, f32),
+        scale_b: (f32, f32),
+        scale_d: (f32, f32),
+    ) -> Vec<u32> {
+        self.run_batch_inner(start_seed, num_seeds, scale_a, scale_b, scale_d, true)
+    }
+
+    fn run_batch_inner(
+        &self,
+        start_seed: u64,
+        num_seeds: u32,
+        scale_a: (f32, f32),
+        scale_b: (f32, f32),
+        scale_d: (f32, f32),
+        multi: bool,
+    ) -> Vec<u32> {
         assert!(num_seeds <= self.batch_size);
 
-        // 1. Upload params (pass full 64-bit start seed as two u32s)
         let params = Params {
-            start_lo:    start_seed as u32,
-            start_hi:    (start_seed >> 32) as u32,
+            start_lo:     start_seed as u32,
+            start_hi:     (start_seed >> 32) as u32,
             num_seeds,
-            num_offsets: self.num_offsets,
-            scale_min:   scale_range.0,
-            scale_max:   scale_range.1,
-            _pad0:       0,
-            _pad1:       0,
+            num_offsets:  self.num_offsets,
+            scale_a_min:  scale_a.0,
+            scale_a_max:  scale_a.1,
+            scale_b_min:  scale_b.0,
+            scale_b_max:  scale_b.1,
+            scale_d_min:  scale_d.0,
+            scale_d_max:  scale_d.1,
+            multi_config: if multi { 1 } else { 0 },
+            _pad:         0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
